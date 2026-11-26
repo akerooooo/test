@@ -19,6 +19,11 @@ namespace MimicGame.UI
         GUIStyle centerStyle, labelStyle, slotStyle;
         float styleScale = -1f;
 
+        // Mikrofon ikonu durumu
+        const float MicIconShow = 1.2f, MicIconFade = 0.5f;
+        bool micStateKnown, lastMuted;
+        float micToggleTime = -100f;
+
         void Awake()
         {
             inventory = GetComponent<PlayerInventory>();
@@ -85,13 +90,44 @@ namespace MimicGame.UI
                 Shadowed(new Rect(30f * s, 25f * s, 800f * s, 34f * s),
                     $"Araçtaki ganimet: {zone.CollectedValue}$ / Kota: {zone.quota}$", labelStyle);
 
-            // Mikrofon kapalı uyarısı
-            var voice = PlayerVoice.Local;
-            if (voice != null && voice.IsMuted)
-                Shadowed(new Rect(30f * s, 60f * s, 400f * s, 30f * s), "Mikrofon kapalı", labelStyle);
+            // Mikrofon açıldı/kapandı ikonu: envanterin üstünde kısa süre görünür, sonra kaybolur
+            DrawMicToggleIcon(s);
 
             if (Cursor.lockState != CursorLockMode.Locked)
                 Shadowed(new Rect(0f, center.y - 60f * s, Screen.width, 40f * s), "Devam etmek için tıkla", centerStyle);
+        }
+
+        void DrawMicToggleIcon(float s)
+        {
+            var voice = PlayerVoice.Local;
+            if (voice == null) { micStateKnown = false; return; }
+
+            bool muted = voice.IsMuted;
+            if (!micStateKnown) { micStateKnown = true; lastMuted = muted; }
+            else if (muted != lastMuted)
+            {
+                lastMuted = muted;
+                micToggleTime = Time.unscaledTime;
+            }
+
+            float t = Time.unscaledTime - micToggleTime;
+            if (t > MicIconShow + MicIconFade) return;
+            float alpha = t <= MicIconShow ? 1f : 1f - (t - MicIconShow) / MicIconFade;
+
+            // Envanterin (ve ağırlık yazısının) üstünde, ortada
+            float iconSize = 56f * s;
+            float invTop = Screen.height - 80f * s - 30f * s;
+            var r = new Rect((Screen.width - iconSize) * 0.5f, invTop - 36f * s - iconSize, iconSize, iconSize);
+
+            var tex = muted ? MicIcon.Off : MicIcon.On;
+            var color = muted ? new Color(0.95f, 0.25f, 0.2f) : new Color(1f, 1f, 1f);
+
+            // Gölge + ikon
+            GUI.color = new Color(0f, 0f, 0f, 0.6f * alpha);
+            GUI.DrawTexture(new Rect(r.x + 2f, r.y + 2f, r.width, r.height), tex);
+            GUI.color = new Color(color.r, color.g, color.b, alpha);
+            GUI.DrawTexture(r, tex);
+            GUI.color = Color.white;
         }
 
         void EnsureStyles(float s)
