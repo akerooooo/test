@@ -35,13 +35,11 @@ namespace MimicGame.Environment
 
         public void Interact(PlayerInteractor interactor)
         {
-            // Geçici teşhis logları
             if (!IsSpawned)
             {
                 Debug.LogWarning($"[Kapı] {name} ağda doğmamış (IsSpawned=false), açılamıyor.");
                 return;
             }
-            Debug.Log($"[Kapı] {name}: aç/kapa isteği sunucuya gönderildi.");
             ToggleRpc();
         }
 
@@ -55,7 +53,6 @@ namespace MimicGame.Environment
                 return;
             }
             isOpen.Value = !isOpen.Value;
-            Debug.Log($"[Kapı] {name}: sunucu durumu değiştirdi -> {(isOpen.Value ? "açık" : "kapalı")}");
         }
     }
 }
