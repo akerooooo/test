@@ -122,6 +122,9 @@ namespace MimicGame.Network
 
             Status = "Lobi kuruluyor...";
             UseFacepunch();
+            // Her oyunda farklı sanal port: önceki oturumdan kalan soketlerle çakışmasın
+            var hostTransport = EnsureFacepunchTransport();
+            hostTransport.virtualPort = UnityEngine.Random.Range(1, 20000);
             if (!nm.StartHost()) { Status = "Oyun kurulamadı."; return; }
 
             Lobby? lobby = null;
@@ -140,6 +143,7 @@ namespace MimicGame.Network
             l.SetJoinable(true);
             l.SetData("game", "MimicGame");
             l.SetData("host", SteamClient.Name);
+            l.SetData("vport", hostTransport.virtualPort.ToString());
             CurrentLobby = l;
             Status = "";
         }
@@ -241,6 +245,7 @@ namespace MimicGame.Network
 
             var t = EnsureFacepunchTransport();
             t.targetSteamId = lobby.Owner.Id;
+            t.virtualPort = int.TryParse(lobby.GetData("vport"), out int vport) ? vport : 0;
             UseFacepunch();
             Status = "Bağlanıyor...";
             if (!nm.StartClient()) Status = "Bağlantı başlatılamadı.";

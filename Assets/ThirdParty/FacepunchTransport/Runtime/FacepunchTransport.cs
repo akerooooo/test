@@ -27,6 +27,9 @@ namespace Netcode.Transports.Facepunch
         [Tooltip("The Steam ID of the user targeted when joining as a client.")]
         [SerializeField] public ulong targetSteamId;
 
+        [Tooltip("Steam relay sanal portu. Host her oyunda rastgele seçer, lobiye yazar; istemci oradan okur.")]
+        public int virtualPort;
+
         [Header("Info")]
         [ReadOnly]
         [Tooltip("When in play mode, this will display your Steam ID.")]
@@ -170,7 +173,7 @@ namespace Netcode.Transports.Facepunch
             if (LogLevel <= LogLevel.Developer)
                 Debug.Log($"[{nameof(FacepunchTransport)}] - Starting as client.");
 
-            connectionManager = SteamNetworkingSockets.ConnectRelay<ConnectionManager>(targetSteamId);
+            connectionManager = SteamNetworkingSockets.ConnectRelay<ConnectionManager>(targetSteamId, virtualPort);
             connectionManager.Interface = this;
             return true;
         }
@@ -180,7 +183,28 @@ namespace Netcode.Transports.Facepunch
             if (LogLevel <= LogLevel.Developer)
                 Debug.Log($"[{nameof(FacepunchTransport)}] - Starting as server.");
 
-            socketManager = SteamNetworkingSockets.CreateRelaySocket<SocketManager>();
+            // Önceki bir oturumdan Steam'de açık kalmış soket varsa ("Invalid Socket")
+            // sıradaki sanal portu dene
+            socketManager = null;
+            for (int i = 0; i < 10 && socketManager == null; i++)
+            {
+                int port = virtualPort + i;
+                try
+                {
+                    socketManager = SteamNetworkingSockets.CreateRelaySocket<SocketManager>(port);
+                    virtualPort = port;
+                }
+                catch (ArgumentException e)
+                {
+                    Debug.LogWarning($"[{nameof(FacepunchTransport)}] - Sanal port {port} kullanılamadı: {e.Message}");
+                    socketManager = null;
+                }
+            }
+            if (socketManager == null)
+            {
+                Debug.LogError($"[{nameof(FacepunchTransport)}] - Steam soketi açılamadı. Unity'yi yeniden başlatmayı dene.");
+                return false;
+            }
             socketManager.Interface = this;
             return true;
         }
