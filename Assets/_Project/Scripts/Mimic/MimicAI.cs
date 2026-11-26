@@ -38,6 +38,7 @@ namespace MimicGame.Mimic
         // Eşikler
         const float ConverseRadius = 20f;   // konuşmaya yanıt
         const float FollowRadius = 18f;     // yakın oyuncuya eşlik
+        const float ApproachStop = 2.8f;    // oyuncunun yanında durma mesafesi
         const float LureRange = 30f;        // çağrı için kurbana azami uzaklık
         const float IsolationRadius = 8f;   // "yalnız" = başka oyuncu bu kadar yakında değil
         const float FarDistance = 15f;      // "uzaktaki arkadaş" eşiği
@@ -479,7 +480,7 @@ namespace MimicGame.Mimic
                 {
                     SetMode(Mode.Follow, "oyuncu " + nearest.OwnerClientId + " " + nearestD.ToString("0") + " m");
                     waiting = false; hasDest = false; nextFollowPath = 0f;
-                    nextFollowSpeak = now + Random.Range(6f, 12f);
+                    nextFollowSpeak = now + Random.Range(3f, 6f);
                     followVictim = ulong.MaxValue;
                 }
                 // Kurban değişince (veya kimlik kurbanın kendisiyse) kimliği düzelt
@@ -500,7 +501,8 @@ namespace MimicGame.Mimic
 
                 if (now >= nextFollowSpeak && now >= speakCooldownUntil)
                 {
-                    nextFollowSpeak = now + Random.Range(12f, 22f);
+                    // Yanındayken daha sık konuşur
+                    nextFollowSpeak = now + (nearestD <= 5f ? Random.Range(5f, 10f) : Random.Range(12f, 22f));
                     bool ok = TrySpeak(nearest, false, "takip", now);
                     speakCooldownUntil = now + (ok ? Random.Range(5f, 12f) : 2f);
                 }
@@ -593,20 +595,6 @@ namespace MimicGame.Mimic
             if (crouching.Value) crouching.Value = false;
             flashlightOn.Value = InsideBuilding(transform.position) && flashlightOn.Value;
 
-            // Küme merkezi: en yakın oyuncunun 6 m içindekiler
-            Vector3 centroid = Vector3.zero;
-            int n = 0;
-            for (int i = 0; i < tmpPlayers.Count; i++)
-            {
-                if (tmpPlayers[i] == null) continue;
-                if (FlatDist(tmpPlayers[i].transform.position, nearest.transform.position) <= 6f)
-                {
-                    centroid += tmpPlayers[i].transform.position;
-                    n++;
-                }
-            }
-            centroid /= Mathf.Max(1, n);
-
             hasLook = true;
             lookPoint = Head(nearest);
 
@@ -614,20 +602,21 @@ namespace MimicGame.Mimic
             agent.speed = nearestSpeed > SprintThreshold ? prof.sprintSpeed : prof.walkSpeed;
             agent.stoppingDistance = 0.5f;
 
-            float dist = FlatDist(transform.position, centroid);
-            if (dist >= 5f && dist <= 9f)
+            // Mimesis gibi: oyuncunun yanına gel (2-3 m), dur, ona dön; asla geri çekilme
+            float dist = FlatDist(transform.position, nearest.transform.position);
+            if (dist <= ApproachStop)
             {
                 agent.ResetPath();
                 return;
             }
             if (now < nextFollowPath) return;
-            nextFollowPath = now + 0.6f;
+            nextFollowPath = now + 0.4f;
 
-            Vector3 away = transform.position - centroid;
-            away.y = 0f;
-            if (away.sqrMagnitude < 0.01f) away = transform.forward;
-            Vector3 want = centroid + away.normalized * 7f;
-            if (NavMesh.SamplePosition(want, out var hit, 4f, NavMesh.AllAreas)) agent.SetDestination(hit.position);
+            Vector3 toMimic = transform.position - nearest.transform.position;
+            toMimic.y = 0f;
+            if (toMimic.sqrMagnitude < 0.01f) toMimic = -nearest.transform.forward;
+            Vector3 want = nearest.transform.position + toMimic.normalized * (ApproachStop - 0.4f);
+            if (NavMesh.SamplePosition(want, out var hit, 3f, NavMesh.AllAreas)) agent.SetDestination(hit.position);
         }
 
         // ---- Cezbetme ----
