@@ -51,16 +51,29 @@ namespace MimicGame.Items
             transform.localRotation = Quaternion.identity;
         }
 
-        public void OnDropped(Vector3 position, Vector3 velocity)
+        public void OnDropped(Vector3 position, Vector3 velocity) =>
+            OnDropped(position, transform.rotation, velocity);
+
+        public void OnDropped(Vector3 position, Quaternion rotation, Vector3 velocity)
         {
             transform.SetParent(null, true);
-            transform.position = position;
+            transform.SetPositionAndRotation(position, rotation);
             IsHeld = false;
             SetVisible(true);
             foreach (var c in colliders) c.enabled = true;
             rb.isKinematic = false;
             rb.interpolation = RigidbodyInterpolation.Interpolate;
             rb.linearVelocity = velocity;
+            rb.angularVelocity = Vector3.zero;
+        }
+
+        /// <summary>Mevcut rotasyonla render sınırlarının yarı yüksekliği (renderer kapalıyken de geçerli).</summary>
+        public float GetHalfHeight()
+        {
+            float h = 0f;
+            foreach (var r in renderers)
+                if (r != null) h = Mathf.Max(h, r.bounds.extents.y);
+            return h;
         }
 
         public void SetVisible(bool visible)

@@ -66,13 +66,29 @@ namespace MimicGame.Player
             if (item == null) return;
             slots[Selected] = null;
 
-            Vector3 dir = viewPoint.forward;
-            Vector3 pos = viewPoint.position + dir * 0.7f;
-            if (Physics.Raycast(viewPoint.position, dir, out var hit, 0.9f, ~0, QueryTriggerInteraction.Ignore))
-                pos = hit.point - dir * 0.25f;
+            // Yatay ileri yön (kamera eğimi yok sayılır)
+            Vector3 fwd = Vector3.ProjectOnPlane(viewPoint.forward, Vector3.up);
+            if (fwd.sqrMagnitude < 0.0001f) fwd = transform.forward;
+            fwd.Normalize();
 
-            Vector3 vel = (motor != null ? motor.HorizontalVelocity : Vector3.zero) + dir * 1.5f;
-            item.OnDropped(pos, vel);
+            // Duvara çarpıyorsa mesafeyi kısalt
+            float distance = 0.8f;
+            if (Physics.Raycast(transform.position + Vector3.up * 0.5f, fwd, out var wall, distance, ~0,
+                    QueryTriggerInteraction.Ignore))
+                distance = Mathf.Max(0f, wall.distance - 0.25f);
+
+            // Önce rotasyonu ayarla, sonra yüksekliği ölç
+            Quaternion rot = Quaternion.Euler(0f, Quaternion.LookRotation(fwd, Vector3.up).eulerAngles.y, 0f);
+            item.transform.rotation = rot;
+            float halfHeight = item.GetHalfHeight();
+
+            // Zemini bul ve eşyayı üstüne koy
+            Vector3 start = transform.position + fwd * distance + Vector3.up * 1.0f;
+            Vector3 pos = start;
+            if (Physics.Raycast(start, Vector3.down, out var floor, 3f, ~0, QueryTriggerInteraction.Ignore))
+                pos = floor.point + Vector3.up * (halfHeight + 0.02f);
+
+            item.OnDropped(pos, rot, Vector3.zero);
             RecalculateWeight();
         }
 
