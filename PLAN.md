@@ -108,7 +108,7 @@ Assets/
 | **0. Kurulum** ✅ | Unity 6.3 LTS + URP projesi, Force Text, git/LFS, NGO paketi, ilk push | Proje açılıyor, repoda |
 | **1. Tek oyunculu temel** ✅ | Birinci şahıs hareket (CharacterController), eğilme, koşma, el feneri, envanter (4 slot), eşya alma/bırakma, ganimet değeri | Test sahnesinde eşya toplayıp araca bırakabiliyorum |
 | **2. Multiplayer** ✅ | NGO host/client, oyuncu ve eşya senkronizasyonu, yerel test (Multiplayer Play Mode) → Steam lobi/davet (AppID 480) | 2 bilgisayarda birlikte eşya toplayabiliyoruz |
-| **3. Sesli sohbet** | Steam Voice, `VoicePlayer`, 3D ses, duvar arkası boğulma, ölünce izleyici modu | Uzaklaşınca ses azalıyor |
+| **3. Sesli sohbet** (kod yazıldı) | Steam Voice, `VoicePlayer`, 3D ses, duvar arkası boğulma, ölünce izleyici modu | Uzaklaşınca ses azalıyor |
 | **4. Taklitçi** | 4a klip kaydı → 4c davranış → 4e görünüş/yürüyüş → 4b whisper ile isimler | Arkadaşlar taklitçiye kandı 🎉 |
 | **5. İç mekân üretimi** | Giriş kapısı/ışınlanma, prosedürel odalar, NavMesh, ganimet dağıtımı | Her oyunda farklı bina |
 | **6. Oyun döngüsü** | Gün/saat, kota, dükkân, oyun sonu | Baştan sona bir tur oynanıyor |

@@ -10,7 +10,7 @@ namespace MimicGame.Player
     /// </summary>
     public class PlayerInputReader : MonoBehaviour
     {
-        InputAction move, look, sprint, crouch, jump, interact, drop, flashlight, use, scroll;
+        InputAction move, look, sprint, crouch, jump, interact, drop, flashlight, use, scroll, mute;
         InputAction[] slotKeys;
 
         public Vector2 Move => move.ReadValue<Vector2>();
@@ -22,6 +22,7 @@ namespace MimicGame.Player
         public bool DropPressed => drop.WasPressedThisFrame();
         public bool FlashlightPressed => flashlight.WasPressedThisFrame();
         public bool UsePressed => use.WasPressedThisFrame();
+        public bool MutePressed => mute.WasPressedThisFrame();
         public float Scroll => scroll.ReadValue<float>();
 
         /// <summary>Bu karede basılan envanter slotu (0-3), yoksa -1.</summary>
@@ -54,6 +55,7 @@ namespace MimicGame.Player
             drop = Button("Drop", "<Keyboard>/g");
             flashlight = Button("Flashlight", "<Keyboard>/f");
             use = Button("Use", "<Mouse>/leftButton");
+            mute = Button("Mute", "<Keyboard>/m");
             scroll = new InputAction("Scroll", InputActionType.Value, "<Mouse>/scroll/y");
 
             slotKeys = new InputAction[4];
@@ -73,7 +75,7 @@ namespace MimicGame.Player
             if (move == null) yield break;
             yield return move; yield return look; yield return sprint; yield return crouch;
             yield return jump; yield return interact; yield return drop; yield return flashlight;
-            yield return use; yield return scroll;
+            yield return use; yield return scroll; yield return mute;
             foreach (var s in slotKeys) yield return s;
         }
     }

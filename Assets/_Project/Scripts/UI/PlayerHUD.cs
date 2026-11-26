@@ -1,5 +1,6 @@
 using MimicGame.Game;
 using MimicGame.Player;
+using MimicGame.Voice;
 using UnityEngine;
 
 namespace MimicGame.UI
@@ -83,6 +84,11 @@ namespace MimicGame.UI
             if (zone != null)
                 Shadowed(new Rect(30f * s, 25f * s, 800f * s, 34f * s),
                     $"Araçtaki ganimet: {zone.CollectedValue}$ / Kota: {zone.quota}$", labelStyle);
+
+            // Mikrofon kapalı uyarısı
+            var voice = PlayerVoice.Local;
+            if (voice != null && voice.IsMuted)
+                Shadowed(new Rect(30f * s, 60f * s, 400f * s, 30f * s), "Mikrofon kapalı", labelStyle);
 
             if (Cursor.lockState != CursorLockMode.Locked)
                 Shadowed(new Rect(0f, center.y - 60f * s, Screen.width, 40f * s), "Devam etmek için tıkla", centerStyle);

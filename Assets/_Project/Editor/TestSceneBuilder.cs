@@ -6,6 +6,7 @@ using MimicGame.Network;
 using MimicGame.Player;
 using Netcode.Transports.Facepunch;
 using MimicGame.UI;
+using MimicGame.Voice;
 using Unity.Netcode;
 using Unity.Netcode.Components;
 using Unity.Netcode.Transports.UTP;
@@ -298,6 +299,7 @@ namespace MimicGame.EditorTools
             var flashlight = player.AddComponent<Flashlight>();
             player.AddComponent<PlayerHUD>();
             var net = player.AddComponent<PlayerNetwork>();
+            var voice = player.AddComponent<PlayerVoice>();
 
             // Kamera
             var camGo = new GameObject("Kamera");
@@ -338,6 +340,14 @@ namespace MimicGame.EditorTools
             Object.DestroyImmediate(body.GetComponent<Collider>());
             var bodyRenderer = body.GetComponent<Renderer>();
             bodyRenderer.sharedMaterial = Mat("Oyuncu Gövde", new Color(0.25f, 0.4f, 0.6f));
+
+            // Ses (ağız hizası; kamerayla birlikte hareket eder)
+            var sesGo = new GameObject("Ses");
+            sesGo.transform.SetParent(camGo.transform, false);
+            sesGo.transform.localPosition = new Vector3(0f, -0.1f, 0f);
+            sesGo.AddComponent<AudioSource>();
+            sesGo.AddComponent<AudioLowPassFilter>();
+            voice.voicePlayer = sesGo.AddComponent<VoicePlayer>();
 
             look.cameraPivot = camGo.transform;
             inventory.viewPoint = camGo.transform;
