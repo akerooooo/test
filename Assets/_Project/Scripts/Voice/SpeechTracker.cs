@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using MimicGame.Player;
 using UnityEngine;
 
 namespace MimicGame.Voice
@@ -29,6 +30,8 @@ namespace MimicGame.Voice
 
         public static void Mark(ulong clientId, Vector3 pos)
         {
+            // Ölülerin sesi canlılara ulaşmaz; taklitçi de yanıt vermesin
+            if (PlayerHealth.IsDead(clientId)) return;
             float now = Time.unscaledTime;
             if (!states.TryGetValue(clientId, out var s))
             {

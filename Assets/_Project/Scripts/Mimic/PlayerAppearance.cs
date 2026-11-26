@@ -34,11 +34,22 @@ namespace MimicGame.Mimic
             r.SetPropertyBlock(block);
         }
 
-        // 2 m'lik kapsül primitifini verilen boya göre ölçekler
-        public static void ApplyBody(Transform body, float height)
+        /// <summary>Doğrudan renk uygular (taklitçinin "gerçek biçim" rengi için).</summary>
+        public static void ApplyColor(Renderer r, Color c)
+        {
+            if (r == null) return;
+            if (block == null) block = new MaterialPropertyBlock();
+            r.GetPropertyBlock(block);
+            block.SetColor("_BaseColor", c);
+            block.SetColor("_Color", c);
+            r.SetPropertyBlock(block);
+        }
+
+        // 2 m'lik kapsül primitifini verilen boya (ve genişliğe) göre ölçekler
+        public static void ApplyBody(Transform body, float height, float width = 0.7f)
         {
             if (body == null) return;
-            body.localScale = new Vector3(0.7f, height * 0.5f, 0.7f);
+            body.localScale = new Vector3(width, height * 0.5f, width);
             body.localPosition = new Vector3(0f, height * 0.5f, 0f);
         }
     }

@@ -1,5 +1,6 @@
 using System.Text;
 using MimicGame.Network;
+using MimicGame.Player;
 using MimicGame.Voice;
 using Unity.Netcode;
 using UnityEngine;
@@ -17,10 +18,12 @@ namespace MimicGame.Mimic
         public int mimicCount = 1;
 
         const float MinSpawnDistance = 8f; // küçük test binası için
+        const float AllDeadResetDelay = 6f; // herkes ölünce tur sıfırlanana kadar
 
         bool wasServer;
         float serverStart;
         bool spawnedInitial;
+        float allDeadSince = -1f;
         bool showDebug; // varsayılan KAPALI (ayırt edilemezlik)
         readonly StringBuilder sb = new StringBuilder(256);
 
@@ -38,6 +41,7 @@ namespace MimicGame.Mimic
                 SpeechTracker.Clear();
                 ClipRecorder.Reset();
                 showDebug = false;
+                allDeadSince = -1f;
             }
             wasServer = server;
             if (!server) return;
@@ -48,13 +52,64 @@ namespace MimicGame.Mimic
                 for (int i = 0; i < mimicCount; i++) SpawnMimic();
             }
 
+            UpdateRoundReset();
+
             if (nm.IsHost && Keyboard.current != null)
             {
+                // Hata ayıklama: F7 yerel oyuncuyu öldürür, F6 herkesi canlandırır
+                if (Keyboard.current.f7Key.wasPressedThisFrame && PlayerHealth.Local != null)
+                    PlayerHealth.Local.ServerKill("hata ayıklama (F7)");
+                if (Keyboard.current.f6Key.wasPressedThisFrame) ReviveAll();
                 if (Keyboard.current.f9Key.wasPressedThisFrame) showDebug = !showDebug;
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
                 if (Keyboard.current.f8Key.wasPressedThisFrame) SpawnMimic();
 #endif
             }
+        }
+
+        // Herkes 6 sn ölü kalırsa: herkesi araç yanında canlandır, taklitçileri sıfırla (geçici tur döngüsü)
+        void UpdateRoundReset()
+        {
+            if (PlayerHealth.All.Count >= 1 && PlayerHealth.AliveCount == 0)
+            {
+                if (allDeadSince < 0f) allDeadSince = Time.time;
+                else if (Time.time - allDeadSince >= AllDeadResetDelay)
+                {
+                    allDeadSince = -1f;
+                    Debug.Log("[Tur] Herkes öldü; tur sıfırlanıyor.");
+                    ReviveAll();
+                    ServerResetRound();
+                }
+            }
+            else allDeadSince = -1f;
+        }
+
+        void ReviveAll()
+        {
+            var list = new System.Collections.Generic.List<PlayerHealth>(PlayerHealth.All);
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (list[i] == null || !list[i].IsSpawned) continue;
+                var pos = new Vector3((i % 4) * 1.5f - 2.25f, 0.05f, -3f);
+                list[i].ServerRevive(pos);
+            }
+        }
+
+        /// <summary>Sunucu: mevcut taklitçileri kaldırır ve doğma zamanlayıcısını yeniden başlatır.</summary>
+        public void ServerResetRound()
+        {
+            var nm = NetworkManager.Singleton;
+            if (nm == null || !nm.IsServer) return;
+            var list = new System.Collections.Generic.List<MimicAI>(MimicAI.All);
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (list[i] == null) continue;
+                var no = list[i].NetworkObject;
+                if (no != null && no.IsSpawned) no.Despawn(true);
+            }
+            serverStart = Time.time;
+            spawnedInitial = false;
+            Debug.Log("[Taklitçi] Tur sıfırlandı; " + firstSpawnSeconds.ToString("0") + " sn sonra yeniden doğacak.");
         }
 
         public void SpawnMimic()
@@ -83,7 +138,7 @@ namespace MimicGame.Mimic
             int pc = 0;
             for (int i = 0; i < players.Count; i++)
             {
-                if (players[i] == null || !players[i].IsSpawned) continue;
+                if (players[i] == null || !players[i].IsSpawned || players[i].IsDead) continue;
                 avg += players[i].transform.position;
                 pc++;
             }
@@ -100,7 +155,7 @@ namespace MimicGame.Mimic
                 for (int j = 0; j < players.Count && ok; j++)
                 {
                     var pl = players[j];
-                    if (pl == null || !pl.IsSpawned) continue;
+                    if (pl == null || !pl.IsSpawned || pl.IsDead) continue;
                     if (Vector3.Distance(pl.transform.position, p) < MinSpawnDistance) ok = false;
                     else if (MimicAI.HasLineOfSight(MimicAI.Head(pl), p + Vector3.up * 1.2f)) ok = false;
                 }
@@ -146,7 +201,7 @@ namespace MimicGame.Mimic
             }
 
             GUI.color = new Color(0f, 0f, 0f, 0.7f);
-            var rect = new Rect(10f, 10f, 520f, 40f + 20f * (4 + MimicAI.All.Count * 4 + list.Count));
+            var rect = new Rect(10f, 10f, 520f, 40f + 20f * (4 + MimicAI.All.Count * 5 + list.Count));
             GUI.DrawTexture(rect, Texture2D.whiteTexture);
             GUI.color = Color.white;
             GUI.Label(new Rect(rect.x + 8f, rect.y + 6f, rect.width - 16f, rect.height - 12f), sb.ToString());

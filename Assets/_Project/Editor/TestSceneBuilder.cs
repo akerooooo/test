@@ -313,6 +313,7 @@ namespace MimicGame.EditorTools
             var net = player.AddComponent<PlayerNetwork>();
             var voice = player.AddComponent<PlayerVoice>();
             player.AddComponent<ClipSharing>();
+            var health = player.AddComponent<PlayerHealth>();
 
             // Kamera
             var camGo = new GameObject("Kamera");
@@ -325,6 +326,11 @@ namespace MimicGame.EditorTools
             cam.backgroundColor = Color.black;
             var listener = camGo.AddComponent<AudioListener>();
             camGo.tag = "MainCamera";
+
+            // Gözlemci kamerası (varsayılan kapalı; sahibi ölünce PlayerHealth açar)
+            var spectator = camGo.AddComponent<SpectatorCamera>();
+            spectator.enabled = false;
+            health.spectator = spectator;
 
             // El feneri
             var lightGo = new GameObject("El Feneri");

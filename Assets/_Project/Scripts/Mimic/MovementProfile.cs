@@ -76,6 +76,7 @@ namespace MimicGame.Mimic
             {
                 var pn = all[i];
                 if (pn == null || !pn.IsSpawned) continue;
+                if (pn.IsDead) { Get(pn.OwnerClientId).hasLast = false; continue; } // ölüler örneklenmez
                 Sample(pn, Get(pn.OwnerClientId), dt);
             }
         }

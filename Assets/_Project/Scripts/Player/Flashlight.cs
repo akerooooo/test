@@ -19,12 +19,14 @@ namespace MimicGame.Player
             NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Owner);
 
         PlayerInputReader input;
+        PlayerHealth health;
         float battery;
         float baseIntensity;
 
         void Awake()
         {
             input = GetComponent<PlayerInputReader>();
+            health = GetComponent<PlayerHealth>();
             battery = maxBattery;
             if (spot != null)
             {
@@ -36,6 +38,14 @@ namespace MimicGame.Player
         void Update()
         {
             if (spot == null) return;
+
+            // Ölü oyuncunun feneri kapalı: sahip değeri sıfırlar, herkes ışığı söndürür
+            if (health != null && health.Dead)
+            {
+                if (IsOwner && IsSpawned && isOn.Value) isOn.Value = false;
+                spot.enabled = false;
+                return;
+            }
 
             if (IsOwner)
             {

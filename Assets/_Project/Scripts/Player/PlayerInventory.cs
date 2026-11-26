@@ -31,11 +31,13 @@ namespace MimicGame.Player
 
         PlayerInputReader input;
         PlayerMotor motor;
+        PlayerHealth health;
 
         void Awake()
         {
             input = GetComponent<PlayerInputReader>();
             motor = GetComponent<PlayerMotor>();
+            health = GetComponent<PlayerHealth>();
         }
 
         /// <summary>Bu oyuncunun verilen slottaki eşyası (yoksa null).</summary>
@@ -122,6 +124,7 @@ namespace MimicGame.Player
         void PickupRpc(NetworkObjectReference itemRef, int slot, RpcParams rpcParams = default)
         {
             if (rpcParams.Receive.SenderClientId != OwnerClientId) return;
+            if (health != null && health.Dead) return; // ölüler eşya alamaz
             if (slot < 0 || slot >= SlotCount) return;
             if (!itemRef.TryGet(out var no) || no == null) return;
             var item = no.GetComponent<Item>();

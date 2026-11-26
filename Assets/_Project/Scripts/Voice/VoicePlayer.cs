@@ -63,6 +63,7 @@ namespace MimicGame.Voice
         PlayState state = PlayState.Prebuffer;
         bool flush;
         bool driftEnabled = true;
+        float playRate = 1f;   // klip oynatma hızı çarpanı (<1: yavaş ve kalın), lock altında
         double frac;           // p0 ile p1 arası kesirli konum
         float hist;            // p[-1]
         float lastOut, fade;
@@ -208,7 +209,7 @@ namespace MimicGame.Voice
         }
 
         /// <summary>Ham örnekleri akıtarak çalar (taklitçiler için). Zaten bir şey çalıyorsa false döner.</summary>
-        public bool PlayClip(float[] samples, int inputSampleRate)
+        public bool PlayClip(float[] samples, int inputSampleRate, float rateScale = 1f)
         {
             if (samples == null || samples.Length == 0 || inputSampleRate <= 0) return false;
             if (IsPlaying) return false;
@@ -216,27 +217,38 @@ namespace MimicGame.Voice
             streamSamples = samples;
             streamRate = inputSampleRate;
             streamPos = 0;
-            BeginStream();
+            BeginStream(rateScale);
             return true;
         }
 
         /// <summary>Kayıtlı bir klibi (ses paketleri) çözerek akıtır. Zaten bir şey çalıyorsa false döner.</summary>
-        public bool PlayClip(VoiceClip clip)
+        public bool PlayClip(VoiceClip clip, float rateScale = 1f)
         {
             if (clip == null || clip.packets == null || clip.packets.Count == 0) return false;
             if (IsPlaying) return false;
             StopStream();
             streamClip = clip;
             streamPacket = 0;
-            BeginStream();
+            BeginStream(rateScale);
             return true;
         }
 
-        void BeginStream()
+        /// <summary>Çalan her şeyi (akış + tampon) hemen keser.</summary>
+        public void Interrupt()
+        {
+            StopStream();
+            lock (sync) ResetPlayback();
+        }
+
+        void BeginStream(float rateScale)
         {
             streaming = true;
             streamDecodedAny = false;
-            lock (sync) driftEnabled = false; // klipte hız oynatma yok
+            lock (sync)
+            {
+                driftEnabled = false; // klipte hız oynatma yok
+                playRate = Mathf.Clamp(rateScale, 0.25f, 2f);
+            }
             FeedStream();
         }
 
@@ -376,7 +388,7 @@ namespace MimicGame.Voice
                     ratio = 1.0 + adj;
                 }
                 smoothRatio += (ratio - smoothRatio) * 0.2;
-                double step = (double)ringRate / sampleRate * smoothRatio;
+                double step = (double)ringRate / sampleRate * smoothRatio * playRate;
 
                 int targetIn = System.Math.Max(3, (int)(tgt * ringRate));
                 int gapLimit = (int)(GapReprebuffer * sampleRate);

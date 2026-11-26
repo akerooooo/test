@@ -15,6 +15,7 @@ namespace MimicGame.UI
         PlayerMotor motor;
         PlayerInteractor interactor;
         Flashlight flashlight;
+        PlayerHealth health;
 
         GUIStyle centerStyle, labelStyle, slotStyle;
         float styleScale = -1f;
@@ -30,6 +31,7 @@ namespace MimicGame.UI
             motor = GetComponent<PlayerMotor>();
             interactor = GetComponent<PlayerInteractor>();
             flashlight = GetComponent<Flashlight>();
+            health = GetComponent<PlayerHealth>();
         }
 
         void OnGUI()
@@ -39,13 +41,18 @@ namespace MimicGame.UI
             var white = Texture2D.whiteTexture;
             var center = new Vector2(Screen.width * 0.5f, Screen.height * 0.5f);
 
-            // Nişangâh
-            GUI.color = new Color(1f, 1f, 1f, 0.8f);
-            GUI.DrawTexture(new Rect(center.x - 2f * s, center.y - 2f * s, 4f * s, 4f * s), white);
-            GUI.color = Color.white;
+            bool dead = health != null && health.Dead;
+
+            // Nişangâh (ölüyken gizli)
+            if (!dead)
+            {
+                GUI.color = new Color(1f, 1f, 1f, 0.8f);
+                GUI.DrawTexture(new Rect(center.x - 2f * s, center.y - 2f * s, 4f * s, 4f * s), white);
+                GUI.color = Color.white;
+            }
 
             // Etkileşim yazısı
-            if (interactor != null)
+            if (!dead && interactor != null)
             {
                 string prompt = interactor.Prompt;
                 if (!string.IsNullOrEmpty(prompt))
@@ -53,7 +60,7 @@ namespace MimicGame.UI
             }
 
             // Envanter
-            if (inventory != null)
+            if (!dead && inventory != null)
             {
                 float size = 80f * s, gap = 10f * s;
                 float total = PlayerInventory.SlotCount * size + (PlayerInventory.SlotCount - 1) * gap;
@@ -75,14 +82,16 @@ namespace MimicGame.UI
             }
 
             // Dayanıklılık
-            if (motor != null && motor.Stamina01 < 0.999f)
+            if (!dead && motor != null && motor.Stamina01 < 0.999f)
                 Bar(new Rect(30f * s, Screen.height - 60f * s, 220f * s, 10f * s), motor.Stamina01,
                     motor.IsExhausted ? new Color(0.9f, 0.3f, 0.2f) : new Color(0.9f, 0.9f, 0.9f), white);
 
             // Fener pili
-            if (flashlight != null && flashlight.IsOn)
+            if (!dead && flashlight != null && flashlight.IsOn)
                 Shadowed(new Rect(30f * s, Screen.height - 95f * s, 300f * s, 30f * s),
                     $"Fener: %{flashlight.Battery01 * 100f:0}", labelStyle);
+
+            if (dead) DrawSpectatorInfo(s, center);
 
             // Ganimet / kota
             var zone = LootZone.Main;
@@ -95,6 +104,21 @@ namespace MimicGame.UI
 
             if (Cursor.lockState != CursorLockMode.Locked)
                 Shadowed(new Rect(0f, center.y - 60f * s, Screen.width, 40f * s), "Devam etmek için tıkla", centerStyle);
+        }
+
+        // Ölüyken: gözlem bilgisi; herkes ölmüşse ortada bilgi yazısı
+        void DrawSpectatorInfo(float s, Vector2 center)
+        {
+            if (PlayerHealth.All.Count >= 1 && PlayerHealth.AliveCount == 0)
+            {
+                Shadowed(new Rect(0f, center.y - 20f * s, Screen.width, 40f * s), "Herkes öldü...", centerStyle);
+                return;
+            }
+            var spec = health.spectator;
+            string text = spec != null && spec.HasTarget
+                ? "Öldün — izliyorsun: Oyuncu " + spec.WatchedClientId + " (Sol tık: değiştir)"
+                : "Öldün";
+            Shadowed(new Rect(0f, Screen.height - 70f * s, Screen.width, 40f * s), text, centerStyle);
         }
 
         void DrawMicToggleIcon(float s)

@@ -27,6 +27,10 @@ namespace MimicGame.Network
         public AudioListener listener;
 
         public CharacterController Controller { get; private set; }
+        public PlayerHealth Health { get; private set; }
+
+        /// <summary>Oyuncu ölü mü (PlayerHealth yoksa false).</summary>
+        public bool IsDead => Health != null && Health.Dead;
 
         readonly NetworkVariable<float> pitch = new NetworkVariable<float>(0f,
             NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Owner);
@@ -54,6 +58,7 @@ namespace MimicGame.Network
             motor = GetComponent<PlayerMotor>();
             look = GetComponent<PlayerLook>();
             netTransform = GetComponent<NetworkTransform>();
+            Health = GetComponent<PlayerHealth>();
         }
 
         public override void OnNetworkSpawn()
@@ -90,10 +95,7 @@ namespace MimicGame.Network
 
             // Spawn noktasına ışınla
             var pos = new Vector3((OwnerClientId % 4) * 1.5f - 2.25f, 0.05f, -3f);
-            Controller.enabled = false;
-            transform.position = pos;
-            Controller.enabled = true;
-            pendingTeleport = true; // ağdaki kopyalar kaymadan zıplasın
+            OwnerTeleport(pos);
 
             MenuCamera.SetActive(false);
             PlayerLook.SetCursorLocked(true);
@@ -106,18 +108,7 @@ namespace MimicGame.Network
 
             // Sunucu: oyuncunun taşıdığı eşyaları ayaklarının altına bırak
             if (IsServer && NetworkManager != null && !NetworkManager.ShutdownInProgress)
-            {
-                ulong id = NetworkObject.NetworkObjectId;
-                var items = Item.All;
-                for (int i = 0; i < items.Count; i++)
-                {
-                    var item = items[i];
-                    if (item == null || item.HolderId != id) continue;
-                    var rot = Quaternion.Euler(0f, item.RestRotation.eulerAngles.y, 0f);
-                    item.ComputeGroundPose(transform.position + Vector3.up * 0.3f, rot, out var p);
-                    item.ServerDrop(p, rot);
-                }
-            }
+                ServerDropItemsOf(NetworkObject);
 
             if (Local == this)
             {
@@ -126,6 +117,33 @@ namespace MimicGame.Network
                 MenuCamera.SetActive(true);
                 PlayerLook.SetCursorLocked(false);
             }
+        }
+
+        /// <summary>Sunucu: oyuncunun taşıdığı tüm eşyaları ayaklarının altına bırakır (ölüm / ayrılma).</summary>
+        public static void ServerDropItemsOf(NetworkObject player)
+        {
+            if (player == null) return;
+            ulong id = player.NetworkObjectId;
+            Vector3 feet = player.transform.position;
+            var items = Item.All;
+            for (int i = 0; i < items.Count; i++)
+            {
+                var item = items[i];
+                if (item == null || item.HolderId != id) continue;
+                var rot = Quaternion.Euler(0f, item.RestRotation.eulerAngles.y, 0f);
+                item.ComputeGroundPose(feet + Vector3.up * 0.3f, rot, out var p);
+                item.ServerDrop(p, rot);
+            }
+        }
+
+        /// <summary>Sahip: oyuncuyu ışınlar (kontrolcü kapatılıp açılır) ve ağ kopyalarına anında bildirir.</summary>
+        public void OwnerTeleport(Vector3 pos)
+        {
+            if (Controller != null) Controller.enabled = false;
+            transform.position = pos;
+            // Ölüyken kontrolcü kapalı kalır (PlayerHealth açar)
+            if (Controller != null) Controller.enabled = !IsDead;
+            pendingTeleport = true; // ağdaki kopyalar kaymadan zıplasın
         }
 
         void OnColorChanged(int oldValue, int newValue) => PlayerAppearance.ApplyColor(bodyRenderer, newValue);

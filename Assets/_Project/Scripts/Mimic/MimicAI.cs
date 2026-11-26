@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using MimicGame.Items;
 using MimicGame.Network;
+using MimicGame.Player;
 using MimicGame.Voice;
 using Unity.Netcode;
 using UnityEngine;
@@ -11,7 +12,7 @@ namespace MimicGame.Mimic
     /// <summary>
     /// Taklitçi: seçtiği oyuncunun görünümünü, hareket alışkanlıklarını ve sesini kopyalar.
     /// Sunucu yetkili; istemciler yalnızca görünümü uygular ve konuşma RPC'sini çalar.
-    /// (Saldırı henüz yok.)
+    /// Uygun anda gerçek biçimini açığa çıkarıp kurbanı kovalar ve öldürür.
     /// </summary>
     public class MimicAI : NetworkBehaviour
     {
@@ -45,7 +46,28 @@ namespace MimicGame.Mimic
         const float SeenRange = 30f;        // kimlik değişimini engelleyen görüş mesafesi
         const float IdentityHold = 20f;     // kimliği en az bu kadar sn koru
 
+        // Saldırı
+        const float AttackIsolatedRange = 3f;     // yalnız kurbana bu kadar yakın >= 2 sn
+        const float AttackIsolatedTime = 2f;
+        const float AttackBehindRange = 2.2f;     // arkasında >= 1.2 sn
+        const float AttackBehindTime = 1.2f;
+        const float AttackBehindAngle = 110f;
+        const float WindUpTime = 0.6f;
+        const float ChaseSpeed = 5.4f;
+        const float ChaseAcceleration = 60f;
+        const float ChaseMaxTime = 12f;
+        const float ChaseGiveUpDistance = 25f;
+        const float ChaseLostSightTime = 3f;
+        const float KillRange = 1.4f;
+        const float PostKillHold = 2f;
+        const float FleeMinDistance = 15f;
+        const float RevealHeight = 2.6f;
+        const float RevealWidth = 0.55f;
+        const float RevealScreamRate = 0.65f;
+        static readonly Color RevealColor = new Color(0.12f, 0.02f, 0.02f);
+
         enum Mode { Wander, Follow, Lure }
+        enum AttackState { None, WindUp, Chase, PostKill, Flee }
         enum ClipPref { Call, Reply }
 
         readonly NetworkVariable<ulong> targetClientId = new NetworkVariable<ulong>(ulong.MaxValue,
@@ -58,9 +80,13 @@ namespace MimicGame.Mimic
             NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
         readonly NetworkVariable<float> pitch = new NetworkVariable<float>(0f,
             NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+        // Gerçek biçim açığa çıktı mı (saldırı boyunca)
+        readonly NetworkVariable<bool> revealed = new NetworkVariable<bool>(false,
+            NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
 
         /// <summary>Taklitçinin kimliği (sesini ve rengini kullandığı oyuncu).</summary>
         public ulong TargetClientId => targetClientId.Value;
+        public bool Revealed => revealed.Value;
 
         static readonly MovementProfile neutralProfile = new MovementProfile();
         static readonly RaycastHit[] losHits = new RaycastHit[32];
@@ -114,6 +140,24 @@ namespace MimicGame.Mimic
         int agentFailCount;
         NavMeshPath tmpPath; // Awake içinde oluşturulur (alan başlatıcısında yasak)
 
+        // Saldırı (sunucu)
+        AttackState atk = AttackState.None;
+        float attackCooldownUntil;
+        float lastTriggerTick;
+        ulong isoVictim = ulong.MaxValue, behindVictim = ulong.MaxValue, followTimeVictim = ulong.MaxValue;
+        float isoTimer, behindTimer, followTime, followLimit;
+        ulong atkVictim;
+        float atkStart, chaseStart, lastSeenVictim, nextChasePath, nextSightCheck;
+        string atkReason = "-";
+        float baseAcceleration = 20f, baseStopping = 0.5f;
+        Vector3 fleeDest;
+        bool fleeHasDest;
+        float fleeStart, fleeAttemptStart;
+        int fleeRetries;
+
+        // Açığa çıkma görünümü (her istemcide)
+        float revealT;
+
         // Tanı
         string lastReason = "-";
         string lastLoggedReason = "";
@@ -133,7 +177,9 @@ namespace MimicGame.Mimic
         {
             All.Add(this);
             colorIndex.OnValueChanged += OnColorChanged;
-            PlayerAppearance.ApplyColor(bodyRenderer, colorIndex.Value);
+            revealed.OnValueChanged += OnRevealedChanged;
+            ApplyBodyColor();
+            revealT = revealed.Value ? 1f : 0f;
             shownHeight = crouching.Value ? CrouchHeight : StandHeight;
             shownPitch = pitch.Value;
             if (spot != null) spot.enabled = flashlightOn.Value;
@@ -143,6 +189,7 @@ namespace MimicGame.Mimic
             PickInitialIdentity();
             nextRetarget = Time.time + 30f;
             speakCooldownUntil = Time.time + Random.Range(4f, 8f);
+            attackCooldownUntil = Time.time + Random.Range(25f, 45f);
             lureCooldownUntil = Time.time + Random.Range(10f, 20f);
             TryEnableAgent();
         }
@@ -151,10 +198,19 @@ namespace MimicGame.Mimic
         {
             All.Remove(this);
             colorIndex.OnValueChanged -= OnColorChanged;
+            revealed.OnValueChanged -= OnRevealedChanged;
             SpeechTracker.SpeechEnded -= OnSpeechEnded;
         }
 
-        void OnColorChanged(int oldValue, int newValue) => PlayerAppearance.ApplyColor(bodyRenderer, newValue);
+        void OnColorChanged(int oldValue, int newValue) => ApplyBodyColor();
+        void OnRevealedChanged(bool oldValue, bool newValue) => ApplyBodyColor();
+
+        // Açıkken kan kırmızısına yakın siyah, değilken kimliğin rengi
+        void ApplyBodyColor()
+        {
+            if (revealed.Value) PlayerAppearance.ApplyColor(bodyRenderer, RevealColor);
+            else PlayerAppearance.ApplyColor(bodyRenderer, colorIndex.Value);
+        }
 
         // ---------- Ortak görünüm ----------
 
@@ -170,13 +226,19 @@ namespace MimicGame.Mimic
             float h = crouching.Value ? CrouchHeight : StandHeight;
             shownHeight = Mathf.MoveTowards(shownHeight, h, CrouchTransition * Time.deltaTime);
             shownPitch = Mathf.Lerp(shownPitch, pitch.Value, 1f - Mathf.Exp(-20f * Time.deltaTime));
-            PlayerAppearance.ApplyBody(body, shownHeight);
+            revealT = Mathf.MoveTowards(revealT, revealed.Value ? 1f : 0f, Time.deltaTime / 0.3f);
+            float bodyH = Mathf.Lerp(shownHeight, RevealHeight, revealT);
+            float bodyW = Mathf.Lerp(0.7f, RevealWidth, revealT);
+            PlayerAppearance.ApplyBody(body, bodyH, bodyW);
+            // Açıkken gövde titrer (±2 cm)
+            if (revealT > 0.01f && body != null)
+                body.localPosition += Random.insideUnitSphere * (0.02f * revealT);
             if (cameraPivot != null)
             {
                 cameraPivot.localPosition = new Vector3(0f, shownHeight - EyeOffsetFromTop, 0f);
                 cameraPivot.localRotation = Quaternion.Euler(shownPitch, 0f, 0f);
             }
-            if (spot != null) spot.enabled = flashlightOn.Value;
+            if (spot != null) spot.enabled = flashlightOn.Value && !revealed.Value;
         }
 
         // ---------- Konuşma ----------
@@ -193,6 +255,16 @@ namespace MimicGame.Mimic
                 return;
             }
             voicePlayer.PlayClip(clip);
+        }
+
+        // Açığa çıkarken: kimliğin bir klibi yavaş (0.65x) ve kalın "çığlık" olarak çalınır
+        [Rpc(SendTo.Everyone, Delivery = RpcDelivery.Reliable, InvokePermission = RpcInvokePermission.Server)]
+        void RevealRpc(ulong speakerClientId, int clipId, byte[] blob)
+        {
+            if (voicePlayer == null || blob == null || blob.Length == 0) return;
+            if (!TryParseBlob(blob, speakerClientId, clipId, out var clip)) return;
+            voicePlayer.Interrupt(); // çalan normal konuşmayı kes
+            voicePlayer.PlayClip(clip, RevealScreamRate);
         }
 
         // blob = her paket için [codec(1) | uzunluk(ushort LE) | bayt...]
@@ -265,6 +337,7 @@ namespace MimicGame.Mimic
                 agent.updateRotation = false; // dönüşü biz yönetiriz
                 agent.Warp(hit.position);
                 agentReady = agent.isOnNavMesh;
+                baseAcceleration = agent.acceleration;
                 if (agentReady) Debug.Log("[Taklitçi] Ajan NavMesh üzerine yerleşti: " + hit.position);
                 else Debug.LogError("[Taklitçi] Ajan açıldı ama NavMesh üzerinde değil: " + hit.position);
             }
@@ -336,7 +409,7 @@ namespace MimicGame.Mimic
             for (int i = 0; i < all.Count; i++)
             {
                 var p = all[i];
-                if (p == null || !p.IsSpawned) continue;
+                if (p == null || !p.IsSpawned || p.IsDead) continue;
                 if (Vector3.Distance(p.transform.position, transform.position) > SeenRange) continue;
                 if (HasLineOfSight(Head(p), chest)) { seenCache = true; break; }
             }
@@ -455,6 +528,15 @@ namespace MimicGame.Mimic
                 if (!agentReady) return;
             }
 
+            // Saldırı sürüyorsa normal davranış durur
+            if (atk != AttackState.None)
+            {
+                pendingSpeakAt = -1f;
+                UpdateAttack(now);
+                UpdateLook();
+                return;
+            }
+
             if (pendingSpeakAt > 0f && now >= pendingSpeakAt)
             {
                 pendingSpeakAt = -1f;
@@ -481,7 +563,7 @@ namespace MimicGame.Mimic
             tmpPlayers.Clear();
             var all = PlayerNetwork.All;
             for (int i = 0; i < all.Count; i++)
-                if (all[i] != null && all[i].IsSpawned) tmpPlayers.Add(all[i]);
+                if (all[i] != null && all[i].IsSpawned && !all[i].IsDead) tmpPlayers.Add(all[i]);
         }
 
         public static Vector3 Head(PlayerNetwork p)
@@ -516,6 +598,9 @@ namespace MimicGame.Mimic
             var nearest = NearestPlayer();
             float nearestD = nearest != null ? FlatDist(transform.position, nearest.transform.position) : float.MaxValue;
             var prof = ProfileFor(nearest);
+
+            // Saldırı tetikleri (bekleme bittiyse)
+            if (CheckAttackTriggers(now, nearest, nearestD)) return;
 
             // Cezbetme sürüyorsa devam et
             if (mode == Mode.Lure)
@@ -791,7 +876,7 @@ namespace MimicGame.Mimic
 
         void OnSpeechEnded(ulong clientId, Vector3 speakerPos)
         {
-            if (!IsServer || !IsSpawned) return;
+            if (!IsServer || !IsSpawned || atk != AttackState.None) return;
             if (FlatDist(transform.position, speakerPos) > ConverseRadius) return;
             if (pendingSpeakAt > 0f || Time.time < speakCooldownUntil) return;
             pendingVictimId = clientId;
@@ -827,6 +912,7 @@ namespace MimicGame.Mimic
 
         bool TrySpeak(PlayerNetwork victim, float radius, bool lockVictim, ClipPref pref, string ctx, float now)
         {
+            if (revealed.Value || atk != AttackState.None) { Reason("açığa çıktı"); return false; }
             if (victim == null) { Reason("kurban yok"); return false; }
             if (now < speakingUntil) { Reason("zaten konuşuyor"); return false; }
 
@@ -891,11 +977,312 @@ namespace MimicGame.Mimic
             return false;
         }
 
+        // ---------- Saldırı ----------
+
+        bool IsIsolated(PlayerNetwork victim)
+        {
+            for (int i = 0; i < tmpPlayers.Count; i++)
+            {
+                var p = tmpPlayers[i];
+                if (p == null || p == victim) continue;
+                if (FlatDist(p.transform.position, victim.transform.position) <= IsolationRadius) return false;
+            }
+            return true;
+        }
+
+        // Her karar adımında: tetikleri say, biri tutarsa saldırıyı başlat
+        bool CheckAttackTriggers(float now, PlayerNetwork nearest, float nearestD)
+        {
+            float dt = Mathf.Clamp(now - lastTriggerTick, 0f, 0.5f);
+            lastTriggerTick = now;
+
+            // 3) Takipte geçen toplam süre (aynı kurban)
+            if (mode == Mode.Follow && nearest != null)
+            {
+                if (nearest.OwnerClientId != followTimeVictim)
+                {
+                    followTimeVictim = nearest.OwnerClientId;
+                    followTime = 0f;
+                    followLimit = Random.Range(45f, 90f);
+                }
+                followTime += dt;
+            }
+
+            if (nearest == null || now < attackCooldownUntil || !agentReady)
+            {
+                isoTimer = 0f;
+                behindTimer = 0f;
+                return false;
+            }
+            ulong id = nearest.OwnerClientId;
+
+            // 1) Yalnız kurbana yakın
+            if (nearestD <= AttackIsolatedRange && IsIsolated(nearest))
+            {
+                if (isoVictim != id) { isoVictim = id; isoTimer = 0f; }
+                isoTimer += dt;
+            }
+            else isoTimer = 0f;
+
+            // 2) Kurbanın arkasında
+            bool behind = false;
+            if (nearestD <= AttackBehindRange)
+            {
+                Vector3 fwd = nearest.transform.forward; fwd.y = 0f;
+                Vector3 to = transform.position - nearest.transform.position; to.y = 0f;
+                behind = fwd.sqrMagnitude > 0.01f && to.sqrMagnitude > 0.0001f && Vector3.Angle(fwd, to) > AttackBehindAngle;
+            }
+            if (behind)
+            {
+                if (behindVictim != id) { behindVictim = id; behindTimer = 0f; }
+                behindTimer += dt;
+            }
+            else behindTimer = 0f;
+
+            string why = null;
+            if (isoTimer >= AttackIsolatedTime) why = "yalnız";
+            else if (behindTimer >= AttackBehindTime) why = "arkadan";
+            else if (mode == Mode.Follow && followTime >= followLimit) why = "sabırsızlandı";
+            if (why == null) return false;
+
+            StartAttack(nearest, why, now);
+            return true;
+        }
+
+        void StartAttack(PlayerNetwork victim, string why, float now)
+        {
+            atk = AttackState.WindUp;
+            atkVictim = victim.OwnerClientId;
+            atkStart = now;
+            atkReason = why;
+            isoTimer = behindTimer = followTime = 0f;
+            followTimeVictim = ulong.MaxValue;
+            fleeHasDest = false;
+            waiting = false; hasDest = false;
+            pendingSpeakAt = -1f;
+            lookOverrideUntil = 0f;
+            attackCooldownUntil = now + Random.Range(25f, 45f); // deneme sayılır
+
+            crouching.Value = false;
+            flashlightOn.Value = false;
+            agent.ResetPath();
+            agent.velocity = Vector3.zero;
+            hasLook = true;
+            lookPoint = Head(victim);
+            revealed.Value = true;
+
+            Debug.Log("[Taklitçi] Saldırı: kurban " + atkVictim + " (" + why + ")");
+            SendRevealScream();
+        }
+
+        // Mevcut kimliğin rastgele bir klibini herkese yollar
+        void SendRevealScream()
+        {
+            ulong id = targetClientId.Value;
+            if (!IsUsable(id)) return;
+            var clips = VoiceClipLibrary.GetClips(id);
+            if (clips.Count == 0) return;
+            var pick = clips[Random.Range(0, clips.Count)];
+            speakingUntil = Time.time + pick.duration / RevealScreamRate + 0.3f;
+            RevealRpc(id, pick.id, BuildBlob(pick));
+        }
+
+        void UpdateAttack(float now)
+        {
+            CollectPlayers();
+            var victim = FindPlayer(atkVictim); // ölü/ayrılmış kurban null döner
+
+            switch (atk)
+            {
+                case AttackState.WindUp:
+                    if (victim == null) { BeginFlee(now, "kurban kayboldu"); return; }
+                    hasLook = true;
+                    lookPoint = Head(victim);
+                    if (now - atkStart >= WindUpTime) BeginChase(now);
+                    break;
+
+                case AttackState.Chase:
+                    UpdateChase(now, victim);
+                    break;
+
+                case AttackState.PostKill:
+                    if (now - atkStart >= PostKillHold) BeginFlee(now, "öldürdü");
+                    break;
+
+                case AttackState.Flee:
+                    UpdateFlee(now);
+                    break;
+            }
+        }
+
+        void BeginChase(float now)
+        {
+            atk = AttackState.Chase;
+            chaseStart = now;
+            lastSeenVictim = now;
+            nextChasePath = 0f;
+            nextSightCheck = 0f;
+            baseStopping = agent.stoppingDistance;
+            agent.isStopped = false;
+            agent.speed = ChaseSpeed;
+            agent.acceleration = ChaseAcceleration;
+            agent.stoppingDistance = 0.2f;
+        }
+
+        void UpdateChase(float now, PlayerNetwork victim)
+        {
+            if (victim == null) { BeginFlee(now, "kurban kayboldu"); return; }
+
+            Vector3 vp = victim.transform.position;
+            float d = FlatDist(transform.position, vp);
+            hasLook = true;
+            lookPoint = Head(victim);
+
+            if (d <= KillRange && Mathf.Abs(vp.y - transform.position.y) < 1.5f)
+            {
+                KillVictim(victim, now);
+                return;
+            }
+
+            if (now >= nextChasePath)
+            {
+                nextChasePath = now + 0.15f;
+                agent.SetDestination(NavMesh.SamplePosition(vp, out var hit, 2f, NavMesh.AllAreas) ? hit.position : vp);
+            }
+
+            if (now >= nextSightCheck)
+            {
+                nextSightCheck = now + 0.2f;
+                if (HasLineOfSight(Head(victim), transform.position + Vector3.up * 1.2f)) lastSeenVictim = now;
+            }
+
+            if (d > ChaseGiveUpDistance) BeginFlee(now, "kurban kurtuldu (uzak)");
+            else if (now - lastSeenVictim > ChaseLostSightTime) BeginFlee(now, "kurban gözden kayboldu");
+            else if (now - chaseStart > ChaseMaxTime) BeginFlee(now, "kovalama süresi doldu");
+        }
+
+        void KillVictim(PlayerNetwork victim, float now)
+        {
+            Debug.Log("[Taklitçi] Öldürdü: " + victim.OwnerClientId);
+            if (victim.Health != null) victim.Health.ServerKill("taklitçi");
+            atk = AttackState.PostKill;
+            atkStart = now;
+            agent.ResetPath();
+            agent.velocity = Vector3.zero;
+        }
+
+        void BeginFlee(float now, string why)
+        {
+            atk = AttackState.Flee;
+            fleeStart = now;
+            fleeAttemptStart = now;
+            fleeRetries = 0;
+            hasLook = false;
+            agent.speed = ChaseSpeed;
+            agent.acceleration = ChaseAcceleration;
+            agent.stoppingDistance = 0.5f;
+            Debug.Log("[Taklitçi] Saldırı sona erdi (" + why + "); kaçıyor.");
+            StartFleeDestination();
+        }
+
+        void StartFleeDestination()
+        {
+            fleeHasDest = PickFleeSpot(out fleeDest);
+            if (fleeHasDest) { agent.isStopped = false; agent.SetDestination(fleeDest); }
+        }
+
+        void UpdateFlee(float now)
+        {
+            CollectPlayers();
+            bool arrived = !fleeHasDest ||
+                FlatDist(transform.position, fleeDest) < 1.5f ||
+                (!agent.pathPending && agent.hasPath && agent.remainingDistance <= agent.stoppingDistance + 0.3f);
+            bool timeout = now - fleeAttemptStart > 25f;
+            if (!arrived && !timeout) return;
+
+            // Varınca hâlâ biri görüyorsa başka bir nokta dene (en çok 3 kez, toplam 40 sn)
+            if (IsSeen() && fleeRetries < 3 && now - fleeStart < 40f)
+            {
+                fleeRetries++;
+                fleeAttemptStart = now;
+                StartFleeDestination();
+                return;
+            }
+            EndAttack(now);
+        }
+
+        // Kimsenin görmediği, mümkünse oyunculardan >= 15 m uzak bir nokta
+        bool PickFleeSpot(out Vector3 result)
+        {
+            result = default;
+            int bestTier = -1;
+            float bestScore = -1f;
+            for (int i = 0; i < 24; i++)
+            {
+                float ang = Random.value * Mathf.PI * 2f;
+                float r = Random.Range(FleeMinDistance, FleeMinDistance + 20f);
+                var c = transform.position + new Vector3(Mathf.Cos(ang), 0f, Mathf.Sin(ang)) * r;
+                if (!NavMesh.SamplePosition(c, out var hit, 3f, NavMesh.AllAreas)) continue;
+                if (FlatDist(hit.position, transform.position) < FleeMinDistance * 0.8f) continue;
+                if (!NavMesh.CalculatePath(transform.position, hit.position, NavMesh.AllAreas, tmpPath)) continue;
+                if (tmpPath.status != NavMeshPathStatus.PathComplete) continue;
+
+                float minPlayer = 100f;
+                bool seenByAny = false;
+                for (int j = 0; j < tmpPlayers.Count; j++)
+                {
+                    var p = tmpPlayers[j];
+                    if (p == null) continue;
+                    minPlayer = Mathf.Min(minPlayer, FlatDist(p.transform.position, hit.position));
+                    if (!seenByAny && HasLineOfSight(Head(p), hit.position + Vector3.up * 1.2f)) seenByAny = true;
+                }
+                int tier = !seenByAny && minPlayer >= FleeMinDistance ? 2 : (!seenByAny ? 1 : 0);
+                if (tier > bestTier || (tier == bestTier && minPlayer > bestScore))
+                {
+                    bestTier = tier;
+                    bestScore = minPlayer;
+                    result = hit.position;
+                }
+            }
+            return bestTier >= 0;
+        }
+
+        // Yeniden gizlen: gerçek biçim kapanır, normal davranış sürer
+        void EndAttack(float now)
+        {
+            atk = AttackState.None;
+            revealed.Value = false;
+            attackCooldownUntil = now + Random.Range(25f, 45f);
+            agent.acceleration = baseAcceleration;
+            agent.stoppingDistance = baseStopping;
+            agent.ResetPath();
+            SetMode(Mode.Wander, "saldırı bitti");
+            waiting = false; hasDest = false; hasLook = false;
+            followVictim = ulong.MaxValue;
+            lureCooldownUntil = Mathf.Max(lureCooldownUntil, now + Random.Range(10f, 20f));
+            speakCooldownUntil = now + Random.Range(4f, 8f);
+            identitySince = now - IdentityHold; // yeni kimlik seçilebilsin
+            nextDecision = now + 0.5f;
+            Debug.Log("[Taklitçi] Kaçtı / gizlendi");
+        }
+
+        string AttackDebug()
+        {
+            float now = Time.time;
+            if (atk != AttackState.None)
+                return atk + " | kurban " + atkVictim + " (" + atkReason + ") | " + (now - atkStart).ToString("0.0") + " sn";
+            string cd = now < attackCooldownUntil ? "bekleme " + (attackCooldownUntil - now).ToString("0") + " sn" : "hazır";
+            return "yok | " + cd + " | yalnız " + isoTimer.ToString("0.0") + "/" + AttackIsolatedTime.ToString("0.0")
+                + " | arkadan " + behindTimer.ToString("0.0") + "/" + AttackBehindTime.ToString("0.0")
+                + " | takip " + followTime.ToString("0") + "/" + followLimit.ToString("0") + " sn";
+        }
+
         // ---------- Tanı ----------
 
         public string DebugText()
         {
             return mode + " | kimlik: Oyuncu " + targetClientId.Value + " (renk " + colorIndex.Value + ") | ajan: " + (agentReady ? "hazır" : "YOK")
+                + "\n    saldırı: " + AttackDebug()
                 + "\n    son konuşma: " + lastReason
                 + "\n    konum: " + transform.position.ToString("F1") + (IsSeen() ? " | görülüyor" : " | görülmüyor");
         }

@@ -29,6 +29,7 @@ namespace MimicGame.Voice
 
         VoiceCapture capture;
         PlayerInputReader input;
+        PlayerHealth health;
         readonly List<VoicePacket> packets = new List<VoicePacket>(8);
 
         // Alıcı tarafı tamponu
@@ -44,6 +45,7 @@ namespace MimicGame.Voice
         void Awake()
         {
             input = GetComponent<PlayerInputReader>();
+            health = GetComponent<PlayerHealth>();
         }
 
         public override void OnNetworkSpawn()
@@ -144,6 +146,12 @@ namespace MimicGame.Voice
 
             // Klip kaydı: canlı sesle aynı paketlerden
             ClipRecorder.OnPacket(OwnerClientId, utterance, codec, data);
+
+            // Ölüler yalnızca ölülere duyulur (klip kaydı yukarıda yapıldı: taklitçi kullanabilir)
+            bool speakerDead = health != null && health.Dead;
+            var me = PlayerHealth.Local;
+            bool meAlive = me == null || !me.Dead;
+            if (speakerDead && meAlive) return;
 
             if (voicePlayer == null) return;
             if (!VoiceCodec.Decode(codec, data, data.Length, ref decodeFloats, out int n, out int rate)) return;
