@@ -131,6 +131,9 @@ namespace Netcode.Transports.Facepunch
 
                 connectionManager?.Close();
                 socketManager?.Close();
+                // İkinci kez kapatılmasın (Steam kapandıktan sonra)
+                connectionManager = null;
+                socketManager = null;
             }
             catch (Exception e)
             {

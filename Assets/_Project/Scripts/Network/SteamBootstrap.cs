@@ -1,4 +1,6 @@
+using Netcode.Transports.Facepunch;
 using Steamworks;
+using Unity.Netcode;
 using UnityEngine;
 
 namespace MimicGame.Network
@@ -64,7 +66,26 @@ namespace MimicGame.Network
 
         static void Shutdown()
         {
-            if (SteamClient.IsValid) SteamClient.Shutdown();
+            if (SteamClient.IsValid)
+            {
+                // Önce lobiden çık ve Steam soketlerini kapat; yoksa soket Steam'de açık kalır
+                // ve sonraki oturumda "Invalid Socket" hatası alınır.
+                try { if (SteamLobby.Instance != null) SteamLobby.Instance.Leave(); }
+                catch (System.Exception e) { Debug.LogWarning(e); }
+
+                var nm = NetworkManager.Singleton;
+                if (nm != null)
+                {
+                    var t = nm.GetComponent<FacepunchTransport>();
+                    if (t != null)
+                    {
+                        try { t.Shutdown(); }
+                        catch (System.Exception e) { Debug.LogWarning(e); }
+                    }
+                }
+
+                SteamClient.Shutdown();
+            }
             Available = false;
         }
     }
