@@ -99,7 +99,7 @@ namespace MimicGame.Player
                 distance = Mathf.Max(0f, wall.distance - 0.25f);
 
             Quaternion rot = Quaternion.Euler(0f, Quaternion.LookRotation(fwd, Vector3.up).eulerAngles.y, 0f);
-            item.ComputeGroundPose(transform.position + fwd * distance + Vector3.up * 0.3f, rot, out var pos);
+            item.FindFreeGroundPose(transform.position + fwd * distance + Vector3.up * 0.3f, rot, out var pos);
             DropRpc(new NetworkObjectReference(item.NetworkObject), pos, rot);
         }
 
@@ -143,7 +143,7 @@ namespace MimicGame.Player
             // Uzak/geçersiz konumu oyuncunun ayağına çek
             if (float.IsNaN(pos.x + pos.y + pos.z) ||
                 Vector3.Distance(transform.position, pos) > MaxDropDistance)
-                item.ComputeGroundPose(transform.position + Vector3.up * 0.3f, rot, out pos);
+                item.FindFreeGroundPose(transform.position + Vector3.up * 0.3f, rot, out pos);
 
             item.ServerDrop(pos, rot);
         }
