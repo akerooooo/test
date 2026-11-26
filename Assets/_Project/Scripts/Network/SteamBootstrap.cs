@@ -29,6 +29,9 @@ namespace MimicGame.Network
             Instance = this;
             DontDestroyOnLoad(gameObject);
 
+            // Çok oyunculu: pencere arka plandayken de oyun (ve ses) çalışmaya devam etsin
+            Application.runInBackground = true;
+
             if (!SteamClient.IsValid)
             {
                 try

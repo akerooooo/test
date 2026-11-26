@@ -24,8 +24,8 @@ namespace MimicGame.Voice
         public float occludedVolume = 0.6f;
         public LayerMask occlusionMask = ~0;
 
-        const float PrebufferSeconds = 0.08f;
-        const float MaxBufferSeconds = 0.4f;
+        const float PrebufferSeconds = 0.15f; // ağ dalgalanmasına karşı tampon
+        const float MaxBufferSeconds = 0.6f;
         const float CheckInterval = 0.1f;
 
         AudioSource source;
@@ -186,7 +186,8 @@ namespace MimicGame.Voice
             int got = 0;
             lock (sync)
             {
-                if (!draining && count >= prebufferSamples) draining = true;
+                bool resumed = false;
+                if (!draining && count >= prebufferSamples) { draining = true; resumed = true; }
                 if (draining)
                 {
                     got = Mathf.Min(count, len);
@@ -196,6 +197,19 @@ namespace MimicGame.Voice
                     head = (head + got) % ring.Length;
                     count -= got;
                     if (count == 0) draining = false; // tekrar ön-tamponlama
+                }
+
+                // Tıkırtı olmasın: yeniden başlarken yumuşak giriş, tampon bitince yumuşak çıkış
+                const int Fade = 96;
+                if (resumed)
+                {
+                    int n = Mathf.Min(Fade, got);
+                    for (int i = 0; i < n; i++) data[i] *= (i + 1f) / n;
+                }
+                if (got > 0 && got < len)
+                {
+                    int n = Mathf.Min(Fade, got);
+                    for (int i = 0; i < n; i++) data[got - 1 - i] *= (i + 1f) / n;
                 }
             }
             for (int i = got; i < len; i++) data[i] = 0f;
