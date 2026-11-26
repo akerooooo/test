@@ -35,15 +35,27 @@ namespace MimicGame.Environment
 
         public void Interact(PlayerInteractor interactor)
         {
-            if (IsSpawned) ToggleRpc();
+            // Geçici teşhis logları
+            if (!IsSpawned)
+            {
+                Debug.LogWarning($"[Kapı] {name} ağda doğmamış (IsSpawned=false), açılamıyor.");
+                return;
+            }
+            Debug.Log($"[Kapı] {name}: aç/kapa isteği sunucuya gönderildi.");
+            ToggleRpc();
         }
 
         [Rpc(SendTo.Server)]
         void ToggleRpc(RpcParams rpcParams = default)
         {
             var player = NetworkManager.SpawnManager.GetPlayerNetworkObject(rpcParams.Receive.SenderClientId);
-            if (player != null && Vector3.Distance(player.transform.position, transform.position) > maxUseDistance) return;
+            if (player != null && Vector3.Distance(player.transform.position, transform.position) > maxUseDistance)
+            {
+                Debug.LogWarning($"[Kapı] {name}: oyuncu çok uzak, istek reddedildi.");
+                return;
+            }
             isOpen.Value = !isOpen.Value;
+            Debug.Log($"[Kapı] {name}: sunucu durumu değiştirdi -> {(isOpen.Value ? "açık" : "kapalı")}");
         }
     }
 }
