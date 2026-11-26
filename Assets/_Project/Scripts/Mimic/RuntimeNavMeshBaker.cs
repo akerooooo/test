@@ -1,5 +1,6 @@
 using Unity.AI.Navigation;
 using UnityEngine;
+using UnityEngine.AI;
 
 namespace MimicGame.Mimic
 {
@@ -13,7 +14,11 @@ namespace MimicGame.Mimic
         void Awake()
         {
             if (surface == null) surface = GetComponent<NavMeshSurface>();
-            if (surface != null) surface.BuildNavMesh();
+            if (surface == null) { Debug.LogError("[NavMesh] NavMeshSurface bulunamadı."); return; }
+            surface.BuildNavMesh();
+            int verts = NavMesh.CalculateTriangulation().vertices.Length;
+            if (verts == 0) Debug.LogError("[NavMesh] Oluşturulan NavMesh boş (0 köşe)! Taklitçi gezinemez.");
+            else Debug.Log("[NavMesh] Oluşturuldu: " + verts + " köşe");
         }
     }
 }

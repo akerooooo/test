@@ -5,13 +5,15 @@ namespace MimicGame.Mimic
 {
     public enum ClipTag { Short, General }
 
-    /// <summary>Kaydedilmiş bir konuşma parçası (mono, float).</summary>
+    /// <summary>
+    /// Kaydedilmiş bir konuşma: canlı sesle birebir aynı ses paketleri. PCM tutulmaz;
+    /// oynatırken VoiceCodec ile çözülür.
+    /// </summary>
     public class VoiceClip
     {
         public ulong speakerClientId;
         public int id;
-        public float[] samples;
-        public int sampleRate;
+        public List<(byte codec, byte[] data)> packets;
         public float duration;
         public ClipTag tag;
     }
@@ -29,12 +31,15 @@ namespace MimicGame.Mimic
 
         public static void Add(VoiceClip clip)
         {
-            if (clip == null || clip.samples == null) return;
+            if (clip == null || clip.packets == null || clip.packets.Count == 0) return;
             if (!clips.TryGetValue(clip.speakerClientId, out var list))
             {
                 list = new List<VoiceClip>(MaxPerSpeaker + 1);
                 clips[clip.speakerClientId] = list;
             }
+            // Aynı kimlik varsa değiştir
+            for (int i = 0; i < list.Count; i++)
+                if (list[i].id == clip.id) { list.RemoveAt(i); break; }
             list.Add(clip);
             while (list.Count > MaxPerSpeaker) list.RemoveAt(0); // en eskiyi at
             ClipAdded?.Invoke(clip);

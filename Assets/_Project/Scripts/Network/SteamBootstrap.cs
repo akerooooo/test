@@ -47,7 +47,18 @@ namespace MimicGame.Network
                 }
             }
             Available = SteamClient.IsValid;
-            if (Available) Error = "";
+            if (Available)
+            {
+                Error = "";
+                // Steam sesi doğrudan çıkış hızında çözsün (ek yeniden örnekleme olmasın)
+                try
+                {
+                    int rate = Mathf.Clamp(AudioSettings.outputSampleRate, 11025, 48000);
+                    SteamUser.SampleRate = (uint)rate;
+                    Debug.Log("[Ses] Steam ses çözme hızı: " + SteamUser.SampleRate + " Hz");
+                }
+                catch (System.Exception e) { Debug.LogWarning(e); }
+            }
             else Error = "Steam başlatılamadı: Steam açık mı?";
 
             // Lobi yöneticisini de oluştur

@@ -1,13 +1,12 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using MimicGame.Network;
 using Steamworks;
 using UnityEngine;
 
 namespace MimicGame.Voice
 {
-    /// <summary>Gönderilecek kodlanmış ses paketi. codec 0: PCM16 LE 16 kHz, codec 1: Steam sıkıştırması.</summary>
+    /// <summary>Gönderilecek kodlanmış ses paketi. codec 0: PCM16 LE (MicRate), codec 1: Steam sıkıştırması.</summary>
     public struct VoicePacket
     {
         public byte codec;
@@ -22,29 +21,38 @@ namespace MimicGame.Voice
     {
         public const byte CodecPcm16 = 0;
         public const byte CodecSteam = 1;
-        public const int MicRate = 16000;
+        /// <summary>Yedek (mikrofon) yolunun GÖNDERİM hızı; yakalama bundan yüksek olabilir.</summary>
+        public const int MicRate = 24000;
 
-        const float VadThreshold = 0.01f;
-        const float VadHangover = 0.3f;
-
-        /// <summary>Yerel oyuncunun çözülmüş PCM'i (örnekler, adet, hız). Dizi sadece çağrı süresince geçerli.</summary>
-        public event Action<float[], int, int> LocalPcm;
+        const int PreferredCaptureRate = 48000;
+        const float VadThreshold = 0.008f;
+        const float VadHangover = 0.5f;
+        const float PreRollSeconds = 0.2f;
+        const int MaxPacketBytes = 960; // 480 örnek
 
         public bool Transmitting { get; private set; }
 
         bool useSteam;
 
-        // Steam
-        readonly MemoryStream decodeStream = new MemoryStream(8192);
-        float[] decodeFloats = new float[4096];
-
         // Mikrofon
         AudioClip micClip;
+        int micRate;
         int micLastPos;
         float vadHang;
-        float[] micBuf = new float[1024];
-        float[] micResampled = new float[1024];
+        bool vadActive;
+        float[] micBuf = new float[2048];
+        float[] micOut = new float[2048];
+        float[] readTmp = new float[1024];
         bool micFailed;
+
+        // Yeniden örnekleme durumu
+        double resPos;
+        float resPrev;
+        bool haveCarry;
+        float carry;
+
+        // Ön kayıt (son 200 ms, gönderim hızında)
+        readonly List<float> preRoll = new List<float>(MicRate / 4);
 
         public VoiceCapture(bool preferSteam)
         {
@@ -74,7 +82,6 @@ namespace MimicGame.Voice
             {
                 try { SteamUser.VoiceRecord = false; } catch (Exception e) { Debug.LogWarning(e); }
             }
-            LocalPcm = null;
         }
 
         /// <summary>Bu karede biriken paketleri listeye ekler.</summary>
@@ -95,21 +102,7 @@ namespace MimicGame.Voice
                 byte[] bytes = SteamUser.ReadVoiceDataBytes();
                 if (bytes == null || bytes.Length == 0) break;
                 output.Add(new VoicePacket { codec = CodecSteam, data = bytes });
-                if (LocalPcm != null) DecodeLocal(bytes);
             }
-        }
-
-        void DecodeLocal(byte[] bytes)
-        {
-            decodeStream.SetLength(0);
-            int written = SteamUser.DecompressVoice(bytes, decodeStream);
-            if (written <= 0) return;
-            int n = written / 2;
-            if (decodeFloats.Length < n) decodeFloats = new float[n];
-            var buf = decodeStream.GetBuffer();
-            for (int i = 0; i < n; i++)
-                decodeFloats[i] = (short)(buf[i * 2] | (buf[i * 2 + 1] << 8)) / 32768f;
-            LocalPcm?.Invoke(decodeFloats, n, (int)SteamUser.SampleRate);
         }
 
         // ---------- Mikrofon yedeği ----------
@@ -117,10 +110,24 @@ namespace MimicGame.Voice
         void StartMic()
         {
             if (micFailed) return;
-            if (Microphone.devices.Length == 0) { micFailed = true; Debug.LogWarning("Mikrofon bulunamadı."); return; }
-            micClip = Microphone.Start(null, true, 1, MicRate);
+            if (Microphone.devices.Length == 0) { micFailed = true; Debug.LogWarning("[Ses] Mikrofon bulunamadı."); return; }
+
+            // Mümkünse 48 kHz yakala (aşağı örneklemede kalite kazancı)
+            int minF, maxF;
+            Microphone.GetDeviceCaps(null, out minF, out maxF);
+            micRate = PreferredCaptureRate;
+            if (maxF > 0) micRate = Mathf.Clamp(PreferredCaptureRate, Mathf.Max(1, minF), maxF);
+
+            micClip = Microphone.Start(null, true, 2, micRate);
+            if (micClip == null) { micFailed = true; Debug.LogWarning("[Ses] Mikrofon başlatılamadı."); return; }
             micLastPos = 0;
             vadHang = 0f;
+            vadActive = false;
+            resPos = 0.0;
+            resPrev = 0f;
+            haveCarry = false;
+            preRoll.Clear();
+            Debug.Log("[Ses] Mikrofon yedeği: yakalama " + micClip.frequency + " Hz, gönderim " + MicRate + " Hz.");
         }
 
         void StopMic()
@@ -130,6 +137,8 @@ namespace MimicGame.Voice
                 Microphone.End(null);
                 micClip = null;
             }
+            vadActive = false;
+            preRoll.Clear();
         }
 
         void PollMic(List<VoicePacket> output)
@@ -152,31 +161,64 @@ namespace MimicGame.Voice
             if (first < n) ReadMic(0, n - first, first);
             micLastPos = pos;
 
-            // Basit ses algılama kapısı
+            int m = ResampleToSendRate(micBuf, n, micClip.frequency);
+            if (m <= 0) return;
+
+            // Ses algılama kapısı
             float sum = 0f;
-            for (int i = 0; i < n; i++) sum += micBuf[i] * micBuf[i];
-            float rms = Mathf.Sqrt(sum / n);
-            if (rms > VadThreshold) vadHang = VadHangover;
-            else vadHang -= (float)n / micClip.frequency;
-            if (vadHang <= 0f) return;
-
-            float[] pcm = micBuf;
-            int pcmCount = n;
-            int rate = micClip.frequency;
-            if (rate != MicRate) { pcmCount = Resample(micBuf, n, rate, MicRate); pcm = micResampled; }
-
-            var bytes = new byte[pcmCount * 2];
-            for (int i = 0; i < pcmCount; i++)
+            for (int i = 0; i < m; i++) sum += micOut[i] * micOut[i];
+            float rms = Mathf.Sqrt(sum / m);
+            float blockSec = (float)m / MicRate;
+            bool wasActive = vadActive;
+            if (rms > VadThreshold) { vadHang = VadHangover; vadActive = true; }
+            else if (vadActive)
             {
-                short s = (short)Mathf.RoundToInt(Mathf.Clamp(pcm[i], -1f, 1f) * 32767f);
-                bytes[i * 2] = (byte)(s & 0xFF);
-                bytes[i * 2 + 1] = (byte)((s >> 8) & 0xFF);
+                vadHang -= blockSec;
+                if (vadHang <= 0f) vadActive = false;
             }
-            output.Add(new VoicePacket { codec = CodecPcm16, data = bytes });
-            LocalPcm?.Invoke(pcm, pcmCount, MicRate);
+
+            if (!vadActive)
+            {
+                // Sessiz: ön kayıt geçmişini güncel tut
+                AppendPreRoll(micOut, m);
+                return;
+            }
+
+            // Konuşma başlıyorsa önce ön kaydı gönder (kelime başı kesilmesin)
+            if (!wasActive && preRoll.Count > 0)
+            {
+                var pre = preRoll.ToArray();
+                preRoll.Clear();
+                EmitPcm(pre, pre.Length, output);
+            }
+            else preRoll.Clear();
+            EmitPcm(micOut, m, output);
         }
 
-        float[] readTmp = new float[1024];
+        void AppendPreRoll(float[] src, int count)
+        {
+            int max = Mathf.RoundToInt(MicRate * PreRollSeconds);
+            for (int i = 0; i < count; i++) preRoll.Add(src[i]);
+            if (preRoll.Count > max) preRoll.RemoveRange(0, preRoll.Count - max);
+        }
+
+        // PCM16'ya çevirip en fazla 960 baytlık (tam örnekli) paketlere böler
+        void EmitPcm(float[] pcm, int count, List<VoicePacket> output)
+        {
+            const int SamplesPerPacket = MaxPacketBytes / 2;
+            for (int off = 0; off < count; off += SamplesPerPacket)
+            {
+                int len = Mathf.Min(SamplesPerPacket, count - off);
+                var bytes = new byte[len * 2];
+                for (int i = 0; i < len; i++)
+                {
+                    short s = (short)Mathf.RoundToInt(Mathf.Clamp(pcm[off + i], -1f, 1f) * 32767f);
+                    bytes[i * 2] = (byte)(s & 0xFF);
+                    bytes[i * 2 + 1] = (byte)((s >> 8) & 0xFF);
+                }
+                output.Add(new VoicePacket { codec = CodecPcm16, data = bytes });
+            }
+        }
 
         void ReadMic(int offset, int count, int dest)
         {
@@ -186,19 +228,51 @@ namespace MimicGame.Voice
             Array.Copy(readTmp, 0, micBuf, dest, count);
         }
 
-        int Resample(float[] src, int n, int inRate, int outRate)
+        // Girdiyi (inRate) gönderim hızına çevirir; sonuç micOut'ta. 2:1 ise ikili ortalama, değilse doğrusal.
+        int ResampleToSendRate(float[] src, int n, int inRate)
         {
-            double step = (double)inRate / outRate;
-            int outCount = Mathf.Max(1, (int)(n / step));
-            if (micResampled.Length < outCount) micResampled = new float[outCount];
-            for (int i = 0; i < outCount; i++)
+            if (inRate == MicRate)
             {
-                double p = i * step;
-                int a = (int)p;
-                int b = Mathf.Min(a + 1, n - 1);
-                micResampled[i] = src[a] + (src[b] - src[a]) * (float)(p - a);
+                if (micOut.Length < n) micOut = new float[n];
+                Array.Copy(src, 0, micOut, 0, n);
+                return n;
             }
-            return outCount;
+
+            if (inRate == MicRate * 2)
+            {
+                // Ortalama alarak yarıya indir (basit düşük geçirgen etkisi)
+                int idx = 0;
+                int outMax = (n + 1) / 2 + 1;
+                if (micOut.Length < outMax) micOut = new float[outMax];
+                int o = 0;
+                if (haveCarry && n > 0)
+                {
+                    micOut[o++] = 0.5f * (carry + src[0]);
+                    idx = 1;
+                    haveCarry = false;
+                }
+                for (; idx + 1 < n; idx += 2) micOut[o++] = 0.5f * (src[idx] + src[idx + 1]);
+                if (idx < n) { carry = src[idx]; haveCarry = true; }
+                return o;
+            }
+
+            // Doğrusal (bloklar arası süreklilikle)
+            double step = (double)inRate / MicRate;
+            int maxOut = (int)(n / step) + 2;
+            if (micOut.Length < maxOut) micOut = new float[maxOut];
+            int cnt = 0;
+            double p = resPos;
+            while (p < n - 1 && cnt < micOut.Length)
+            {
+                int i = (int)Math.Floor(p);
+                float a = i < 0 ? resPrev : src[i];
+                float b = src[i + 1];
+                micOut[cnt++] = a + (b - a) * (float)(p - i);
+                p += step;
+            }
+            resPos = p - n;
+            resPrev = src[n - 1];
+            return cnt;
         }
     }
 }

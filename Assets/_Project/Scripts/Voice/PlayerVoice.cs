@@ -1,9 +1,8 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
+using MimicGame.Mimic;
 using MimicGame.Network;
 using MimicGame.Player;
-using Steamworks;
 using Unity.Netcode;
 using UnityEngine;
 
@@ -18,12 +17,11 @@ namespace MimicGame.Voice
         /// <summary>Yerel oyuncunun PlayerVoice'u (sahip doğunca atanır).</summary>
         public static PlayerVoice Local { get; private set; }
 
-        /// <summary>Yerel oyuncunun çözülmüş sesi (örnekler, adet, hız). Dizi sadece çağrı süresince geçerli.</summary>
-        public static event Action<float[], int, int> LocalPcmCaptured;
-
         /// <summary>Ağ paketinde güvenli yük sınırı (bayt).</summary>
         const int MaxPayload = 1000;
         const int MaxIncoming = 65536;
+        const float UtteranceGap = 0.45f;   // bu kadar sessizlikte yeni konuşma
+        const float UtteranceMax = 5f;      // sürekli akışta zorla bölme
 
         public VoicePlayer voicePlayer;
 
@@ -33,9 +31,13 @@ namespace MimicGame.Voice
         PlayerInputReader input;
         readonly List<VoicePacket> packets = new List<VoicePacket>(8);
 
-        // Alıcı tarafı tamponları
-        readonly MemoryStream decodeStream = new MemoryStream(8192);
+        // Alıcı tarafı tamponu
         float[] decodeFloats = new float[4096];
+
+        // Konuşma (utterance) numaralandırma: sahip tarafı atar
+        int utteranceId;
+        float lastSendTime = -100f;
+        float utteranceStart;
 
         bool warnedNoCapture;
 
@@ -49,10 +51,11 @@ namespace MimicGame.Voice
             if (!IsOwner) return;
             Local = this;
             IsMuted = false;
+            utteranceId = UnityEngine.Random.Range(1, 1 << 20);
+            lastSendTime = -100f;
             try
             {
                 capture = new VoiceCapture(SteamBootstrap.Available);
-                capture.LocalPcm += ForwardLocalPcm;
             }
             catch (Exception e)
             {
@@ -73,12 +76,9 @@ namespace MimicGame.Voice
         void StopCapture()
         {
             if (capture == null) return;
-            capture.LocalPcm -= ForwardLocalPcm;
             capture.Shutdown();
             capture = null;
         }
-
-        void ForwardLocalPcm(float[] samples, int count, int rate) => LocalPcmCaptured?.Invoke(samples, count, rate);
 
         void Update()
         {
@@ -112,59 +112,41 @@ namespace MimicGame.Voice
             // Host'un kendi sesi: sunucu konuşma sinyali
             if (IsServer) SpeechTracker.Mark(OwnerClientId, transform.position);
 
-            if (p.codec == VoiceCapture.CodecPcm16)
+            // Konuşma numarası: >= 0.45 sn ara veya 5 sn'yi aşan akışta yenisi
+            float now = Time.unscaledTime;
+            if (now - lastSendTime >= UtteranceGap || now - utteranceStart > UtteranceMax)
             {
-                // Tam örnek sınırlarında parçala
-                int chunk = MaxPayload & ~1;
-                for (int off = 0; off < data.Length; off += chunk)
-                {
-                    int len = Math.Min(chunk, data.Length - off);
-                    var part = new byte[len];
-                    Buffer.BlockCopy(data, off, part, 0, len);
-                    VoiceRpc(p.codec, part);
-                }
-                return;
+                utteranceId++;
+                utteranceStart = now;
             }
+            lastSendTime = now;
 
-            // Steam paketi bölünemez: büyükse güvenilir kanaldan gönder
-            if (data.Length <= MaxPayload) VoiceRpc(p.codec, data);
-            else VoiceReliableRpc(p.codec, data);
+            // Kendi sesimizi de kliplere kaydet (diğerleri Receive'de kaydeder)
+            ClipRecorder.OnPacket(OwnerClientId, utteranceId, p.codec, data);
+
+            // Büyükse güvenilir kanaldan gönder (Steam paketi bölünemez)
+            if (data.Length <= MaxPayload) VoiceRpc(p.codec, utteranceId, data);
+            else VoiceReliableRpc(p.codec, utteranceId, data);
         }
 
         [Rpc(SendTo.NotMe, Delivery = RpcDelivery.Unreliable, InvokePermission = RpcInvokePermission.Owner)]
-        void VoiceRpc(byte codec, byte[] data) => Receive(codec, data);
+        void VoiceRpc(byte codec, int utt, byte[] data) => Receive(codec, utt, data);
 
         [Rpc(SendTo.NotMe, Delivery = RpcDelivery.Reliable, InvokePermission = RpcInvokePermission.Owner)]
-        void VoiceReliableRpc(byte codec, byte[] data) => Receive(codec, data);
+        void VoiceReliableRpc(byte codec, int utt, byte[] data) => Receive(codec, utt, data);
 
-        void Receive(byte codec, byte[] data)
+        void Receive(byte codec, int utterance, byte[] data)
         {
-            if (IsServer && !IsOwner && data != null && data.Length > 0)
+            if (data == null || data.Length == 0 || data.Length > MaxIncoming) return;
+            if (IsServer && !IsOwner)
                 SpeechTracker.Mark(OwnerClientId, transform.position);
-            if (IsOwner || voicePlayer == null || data == null) return;
-            if (data.Length == 0 || data.Length > MaxIncoming) return;
+            if (IsOwner) return;
 
-            if (codec == VoiceCapture.CodecPcm16)
-            {
-                PushPcm16(data, data.Length, VoiceCapture.MicRate);
-            }
-            else if (codec == VoiceCapture.CodecSteam)
-            {
-                if (!SteamBootstrap.Available) return; // Steam yoksa çözemeyiz
-                decodeStream.SetLength(0);
-                int written = SteamUser.DecompressVoice(data, decodeStream);
-                if (written <= 0) return;
-                PushPcm16(decodeStream.GetBuffer(), written, (int)SteamUser.SampleRate);
-            }
-        }
+            // Klip kaydı: canlı sesle aynı paketlerden
+            ClipRecorder.OnPacket(OwnerClientId, utterance, codec, data);
 
-        void PushPcm16(byte[] buf, int byteCount, int rate)
-        {
-            int n = byteCount / 2;
-            if (n <= 0) return;
-            if (decodeFloats.Length < n) decodeFloats = new float[n];
-            for (int i = 0; i < n; i++)
-                decodeFloats[i] = (short)(buf[i * 2] | (buf[i * 2 + 1] << 8)) / 32768f;
+            if (voicePlayer == null) return;
+            if (!VoiceCodec.Decode(codec, data, data.Length, ref decodeFloats, out int n, out int rate)) return;
             voicePlayer.PushSamples(decodeFloats, n, rate);
         }
     }

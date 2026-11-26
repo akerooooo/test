@@ -12,7 +12,8 @@ namespace MimicGame.Voice
     public class VoicePlayer : MonoBehaviour
     {
         [Header("Çıkış")]
-        public int sampleRate = 24000;
+        /// <summary>Çıkış hızı; Awake'te AudioSettings.outputSampleRate'ten alınır.</summary>
+        [HideInInspector] public int sampleRate = 48000;
         [Range(0f, 1f)] public float volume = 1f;
 
         [Header("Mesafe")]
@@ -28,6 +29,8 @@ namespace MimicGame.Voice
         const float PrebufferSeconds = 0.15f; // ağ dalgalanmasına karşı tampon
         const float MaxBufferSeconds = 0.6f;
         const float CheckInterval = 0.1f;
+        const float StreamAheadSeconds = 0.3f; // klip akışında tamponda tutulacak miktar
+        const float ArrayChunkSeconds = 0.1f;
 
         AudioSource source;
         AudioLowPassFilter lowPass;
@@ -37,7 +40,7 @@ namespace MimicGame.Voice
         readonly object sync = new object();
         float[] ring;
         int head, count;
-        bool draining;
+        bool draining, flush;
         int prebufferSamples, maxBufferSamples;
 
         // Yeniden örnekleme durumu (lock altında)
@@ -48,6 +51,14 @@ namespace MimicGame.Voice
 
         volatile float level;
 
+        // Klip akışı (yalnızca ana iş parçacığı)
+        VoiceClip streamClip;
+        int streamPacket;
+        float[] streamSamples;
+        int streamRate, streamPos;
+        float[] streamDecode = new float[4096];
+        bool streaming;
+
         // Tıkanma
         static AudioListener cachedListener;
         readonly RaycastHit[] hits = new RaycastHit[16];
@@ -56,12 +67,21 @@ namespace MimicGame.Voice
         float curCutoff, curMul = 1f;
 
         /// <summary>Tamponda çalınacak ses var mı (ileride taklitçi mantığı için).</summary>
-        public bool IsPlaying { get { lock (sync) return count > 0; } }
+        public bool IsPlaying
+        {
+            get
+            {
+                if (streaming) return true;
+                lock (sync) return count > 0 || draining;
+            }
+        }
         /// <summary>Son okunan bloğun RMS değeri (ileride taklitçi mantığı için).</summary>
         public float CurrentLevel => level;
 
         void Awake()
         {
+            int outRate = AudioSettings.outputSampleRate;
+            sampleRate = outRate > 0 ? outRate : 48000;
             source = GetComponent<AudioSource>();
             lowPass = GetComponent<AudioLowPassFilter>();
             if (lowPass == null) lowPass = gameObject.AddComponent<AudioLowPassFilter>();
@@ -97,7 +117,8 @@ namespace MimicGame.Voice
         void OnDisable()
         {
             if (source != null) source.Stop();
-            lock (sync) { head = 0; count = 0; draining = false; }
+            lock (sync) { head = 0; count = 0; draining = false; flush = false; }
+            StopStream();
         }
 
         void OnDestroy()
@@ -141,11 +162,82 @@ namespace MimicGame.Voice
             }
         }
 
-        /// <summary>Kayıtlı bir klibi çalar (taklitçiler için). PushSamples ile aynı.</summary>
-        public void PlayClip(float[] samples, int inputSampleRate)
+        /// <summary>Ham örnekleri akıtarak çalar (taklitçiler için). Zaten bir şey çalıyorsa false döner.</summary>
+        public bool PlayClip(float[] samples, int inputSampleRate)
         {
-            if (samples == null) return;
-            PushSamples(samples, samples.Length, inputSampleRate);
+            if (samples == null || samples.Length == 0 || inputSampleRate <= 0) return false;
+            if (IsPlaying) return false;
+            StopStream();
+            streamSamples = samples;
+            streamRate = inputSampleRate;
+            streamPos = 0;
+            streaming = true;
+            FeedStream();
+            return true;
+        }
+
+        /// <summary>Kayıtlı bir klibi (ses paketleri) çözerek akıtır. Zaten bir şey çalıyorsa false döner.</summary>
+        public bool PlayClip(VoiceClip clip)
+        {
+            if (clip == null || clip.packets == null || clip.packets.Count == 0) return false;
+            if (IsPlaying) return false;
+            StopStream();
+            streamClip = clip;
+            streamPacket = 0;
+            streaming = true;
+            FeedStream();
+            return true;
+        }
+
+        // Klip bitti: ön-tamponlamayı beklemeden kalan kuyruğu da çal
+        void EndStream()
+        {
+            lock (sync) flush = count > 0;
+            StopStream();
+        }
+
+        void StopStream()
+        {
+            streaming = false;
+            streamClip = null;
+            streamSamples = null;
+            streamPacket = 0;
+            streamPos = 0;
+        }
+
+        int Buffered()
+        {
+            lock (sync) return count;
+        }
+
+        // Tamponu ~0.3 sn ileride tutacak kadar çöz ve ekle
+        void FeedStream()
+        {
+            if (!streaming) return;
+            int target = Mathf.RoundToInt(sampleRate * StreamAheadSeconds);
+            for (int guard = 0; guard < 64 && Buffered() < target; guard++)
+            {
+                if (streamClip != null)
+                {
+                    var pk = streamClip.packets;
+                    if (streamPacket >= pk.Count) { EndStream(); return; }
+                    var (codec, data) = pk[streamPacket++];
+                    if (data == null) continue;
+                    if (!VoiceCodec.Decode(codec, data, data.Length, ref streamDecode, out int n, out int rate)) continue;
+                    PushSamples(streamDecode, n, rate);
+                }
+                else if (streamSamples != null)
+                {
+                    int chunk = Mathf.Max(1, Mathf.RoundToInt(streamRate * ArrayChunkSeconds));
+                    int len = Mathf.Min(chunk, streamSamples.Length - streamPos);
+                    if (len <= 0) { EndStream(); return; }
+                    if (streamDecode.Length < len) streamDecode = new float[len];
+                    System.Array.Copy(streamSamples, streamPos, streamDecode, 0, len);
+                    streamPos += len;
+                    PushSamples(streamDecode, len, streamRate);
+                }
+                else { StopStream(); return; }
+            }
         }
 
         // lock altında çağrılır
@@ -188,7 +280,7 @@ namespace MimicGame.Voice
             lock (sync)
             {
                 bool resumed = false;
-                if (!draining && count >= prebufferSamples) { draining = true; resumed = true; }
+                if (!draining && count > 0 && (count >= prebufferSamples || flush)) { draining = true; resumed = true; }
                 if (draining)
                 {
                     got = Mathf.Min(count, len);
@@ -197,7 +289,7 @@ namespace MimicGame.Voice
                     if (first < got) System.Array.Copy(ring, 0, data, first, got - first);
                     head = (head + got) % ring.Length;
                     count -= got;
-                    if (count == 0) draining = false; // tekrar ön-tamponlama
+                    if (count == 0) { draining = false; flush = false; } // tekrar ön-tamponlama
                 }
 
                 // Tıkırtı olmasın: yeniden başlarken yumuşak giriş, tampon bitince yumuşak çıkış
@@ -222,6 +314,7 @@ namespace MimicGame.Voice
 
         void Update()
         {
+            FeedStream();
             if (Time.time >= nextCheck)
             {
                 nextCheck = Time.time + CheckInterval;

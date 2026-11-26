@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using MimicGame.Items;
 using MimicGame.Network;
 using MimicGame.Voice;
 using Unity.Netcode;
@@ -34,6 +35,14 @@ namespace MimicGame.Mimic
         const float EyeOffsetFromTop = 0.15f;
         const float SprintThreshold = 4.5f;
 
+        // Eşikler
+        const float ConverseRadius = 20f;   // konuşmaya yanıt
+        const float FollowRadius = 18f;     // yakın oyuncuya eşlik
+        const float LureRange = 30f;        // çağrı için kurbana azami uzaklık
+        const float IsolationRadius = 8f;   // "yalnız" = başka oyuncu bu kadar yakında değil
+        const float FarDistance = 15f;      // "uzaktaki arkadaş" eşiği
+        const float SeenRange = 30f;        // kimlik değişimini engelleyen görüş mesafesi
+
         enum Mode { Wander, Follow, Lure }
 
         readonly NetworkVariable<ulong> targetClientId = new NetworkVariable<ulong>(ulong.MaxValue,
@@ -47,7 +56,11 @@ namespace MimicGame.Mimic
         readonly NetworkVariable<float> pitch = new NetworkVariable<float>(0f,
             NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
 
+        /// <summary>Taklitçinin kimliği (sesini ve rengini kullandığı oyuncu).</summary>
         public ulong TargetClientId => targetClientId.Value;
+
+        static readonly MovementProfile neutralProfile = new MovementProfile();
+        static readonly RaycastHit[] losHits = new RaycastHit[32];
 
         NavMeshAgent agent;
         float shownHeight = StandHeight;
@@ -69,7 +82,7 @@ namespace MimicGame.Mimic
         float speakCooldownUntil;
         float pendingSpeakAt = -1f;
         float lureCooldownUntil;
-        readonly int[] recentClips = { -1, -1, -1 };
+        readonly long[] recentClips = { -1, -1, -1 };
 
         // Cezbetme
         Vector3 lureSpot;
@@ -80,7 +93,27 @@ namespace MimicGame.Mimic
         // Bakış
         bool hasLook;
         Vector3 lookPoint;
+        float lookOverrideUntil;     // konuşurken kurbana dön
+        ulong lookOverrideId;
         readonly List<PlayerNetwork> tmpPlayers = new List<PlayerNetwork>(8);
+
+        // Kimlik / görünürlük
+        readonly List<ulong> candidates = new List<ulong>(8);
+        bool seenCache;
+        float seenCacheUntil;
+        float nextIdentityTry;
+        ulong followVictim = ulong.MaxValue;
+        float nextFollowSpeak;
+        ulong pendingVictimId = ulong.MaxValue;
+        float speakingUntil;
+        float nextAgentTry;
+        int agentFailCount;
+        readonly NavMeshPath tmpPath = new NavMeshPath();
+
+        // Tanı
+        string lastReason = "-";
+        string lastLoggedReason = "";
+        float lastReasonLogTime = -100f;
 
         void Awake()
         {
@@ -102,7 +135,7 @@ namespace MimicGame.Mimic
 
             if (!IsServer) return;
             SpeechTracker.SpeechEnded += OnSpeechEnded;
-            PickTarget();
+            PickInitialIdentity();
             nextRetarget = Time.time + 30f;
             speakCooldownUntil = Time.time + Random.Range(4f, 8f);
             lureCooldownUntil = Time.time + Random.Range(10f, 20f);
@@ -147,61 +180,206 @@ namespace MimicGame.Mimic
         void SpeakRpc(ulong speakerClientId, int clipId)
         {
             if (voicePlayer == null) return;
-            if (!VoiceClipLibrary.TryGet(speakerClientId, clipId, out var clip)) return;
-            voicePlayer.PlayClip(clip.samples, clip.sampleRate);
+            if (!VoiceClipLibrary.TryGet(speakerClientId, clipId, out var clip))
+            {
+                Debug.LogWarning("[Taklitçi] Klip bu makinede yok: konuşmacı " + speakerClientId + ", klip " + clipId);
+                return;
+            }
+            voicePlayer.PlayClip(clip);
         }
 
         // ---------- Sunucu ----------
 
+        void SetMode(Mode m, string why)
+        {
+            if (mode == m) return;
+            Debug.Log("[Taklitçi] Durum: " + mode + " -> " + m + " (" + why + ")");
+            mode = m;
+        }
+
         void TryEnableAgent()
         {
             if (agentReady || agent == null) return;
-            if (NavMesh.SamplePosition(transform.position, out var hit, 6f, NavMesh.AllAreas))
+            if (Time.time < nextAgentTry) return;
+            nextAgentTry = Time.time + 1f; // her saniye tekrar dene
+
+            if (NavMesh.SamplePosition(transform.position, out var hit, 5f, NavMesh.AllAreas))
             {
                 transform.position = hit.position;
                 agent.enabled = true;
                 agent.updateRotation = false; // dönüşü biz yönetiriz
                 agent.Warp(hit.position);
                 agentReady = agent.isOnNavMesh;
+                if (agentReady) Debug.Log("[Taklitçi] Ajan NavMesh üzerine yerleşti: " + hit.position);
+                else Debug.LogError("[Taklitçi] Ajan açıldı ama NavMesh üzerinde değil: " + hit.position);
+            }
+            else
+            {
+                agentFailCount++;
+                if (agentFailCount == 1 || agentFailCount % 10 == 0)
+                    Debug.LogError("[Taklitçi] NavMeshAgent yerleştirilemedi: 5 m içinde NavMesh yok, konum " + transform.position);
             }
         }
 
-        void PickTarget()
+        // ---------- Kimlik ----------
+
+        int ColorFor(ulong clientId)
+        {
+            var nm = NetworkManager;
+            if (nm != null && nm.IsServer)
+            {
+                var po = nm.SpawnManager.GetPlayerNetworkObject(clientId);
+                var pn = po != null ? po.GetComponent<PlayerNetwork>() : null;
+                if (pn != null) return pn.ColorIndex;
+            }
+            return (int)(clientId % (ulong)PlayerAppearance.Palette.Length);
+        }
+
+        void SetIdentity(ulong id)
+        {
+            targetClientId.Value = id;
+            colorIndex.Value = ColorFor(id);
+            Debug.Log("[Taklitçi] Kimlik: Oyuncu " + id + " (renk " + colorIndex.Value + ")");
+        }
+
+        // Doğuşta: kurban henüz yok; klibi olan rastgele bir oyuncu, yoksa herhangi biri
+        void PickInitialIdentity()
         {
             var nm = NetworkManager;
             if (nm == null) return;
+            var list = nm.ConnectedClientsList;
             var withClips = new List<ulong>();
             var any = new List<ulong>();
-            var list = nm.ConnectedClientsList;
             for (int i = 0; i < list.Count; i++)
             {
                 ulong id = list[i].ClientId;
                 any.Add(id);
-                if (VoiceClipLibrary.Count(id) > 0) withClips.Add(id);
+                if (VoiceClipLibrary.Count(id) > 0 && ClipSharing.IsAllowed(id)) withClips.Add(id);
             }
             var pool = withClips.Count > 0 ? withClips : any;
             if (pool.Count == 0) return;
-            ulong chosen = pool[Random.Range(0, pool.Count)];
-            targetClientId.Value = chosen;
-            var po = nm.SpawnManager.GetPlayerNetworkObject(chosen);
-            var pn = po != null ? po.GetComponent<PlayerNetwork>() : null;
-            colorIndex.Value = pn != null ? pn.ColorIndex : (int)(chosen % (ulong)PlayerAppearance.Palette.Length);
+            SetIdentity(pool[Random.Range(0, pool.Count)]);
         }
 
         void CheckRetarget()
         {
             var nm = NetworkManager;
             if (nm == null) return;
-            ulong cur = targetClientId.Value;
-            bool connected = nm.ConnectedClients.ContainsKey(cur);
-            bool hasClips = VoiceClipLibrary.Count(cur) > 0;
-            if (!connected) { PickTarget(); return; }
-            if (hasClips) return;
-            // Mevcut hedefin klibi yok; klibi olan biri varsa ona geç
+            // Kimliğin sahibi ayrıldıysa (ve kimse görmüyorsa) yenisini seç
+            if (!nm.ConnectedClients.ContainsKey(targetClientId.Value) && !IsSeen()) PickInitialIdentity();
+        }
+
+        /// <summary>Herhangi bir oyuncunun 30 m içinde, kafasından taklitçinin göğsüne görüş hattı var mı?</summary>
+        bool IsSeen()
+        {
+            if (Time.time < seenCacheUntil) return seenCache;
+            seenCacheUntil = Time.time + 0.15f;
+            seenCache = false;
+            Vector3 chest = transform.position + Vector3.up * 1.2f;
+            var all = PlayerNetwork.All;
+            for (int i = 0; i < all.Count; i++)
+            {
+                var p = all[i];
+                if (p == null || !p.IsSpawned) continue;
+                if (Vector3.Distance(p.transform.position, transform.position) > SeenRange) continue;
+                if (HasLineOfSight(Head(p), chest)) { seenCache = true; break; }
+            }
+            return seenCache;
+        }
+
+        /// <summary>İki nokta arası engelsiz mi? Oyuncu kapsülleri, eşyalar ve taklitçiler yok sayılır.</summary>
+        public static bool HasLineOfSight(Vector3 from, Vector3 to)
+        {
+            Vector3 dir = to - from;
+            float dist = dir.magnitude;
+            if (dist < 0.05f) return true;
+            int n = Physics.RaycastNonAlloc(from, dir / dist, losHits, dist, ~0, QueryTriggerInteraction.Ignore);
+            for (int i = 0; i < n; i++)
+            {
+                var col = losHits[i].collider;
+                if (col == null) continue;
+                if (col is CharacterController) continue;
+                if (col.GetComponentInParent<Item>() != null) continue;
+                if (col.GetComponentInParent<MimicAI>() != null) continue;
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Kurban için kimlik seç: kurban dışındaki, klibi olan ve izin veren oyunculardan;
+        /// kurbana >15 m uzaktakilerin en uzağı, yoksa rastgele (mevcut kimlik uygunsa o kalır).
+        /// Aday yoksa false.
+        /// </summary>
+        bool ResolveIdentity(PlayerNetwork victim, out ulong id)
+        {
+            id = ulong.MaxValue;
+            var nm = NetworkManager;
+            if (nm == null || victim == null) return false;
+
+            candidates.Clear();
             var list = nm.ConnectedClientsList;
             for (int i = 0; i < list.Count; i++)
-                if (VoiceClipLibrary.Count(list[i].ClientId) > 0) { PickTarget(); return; }
+            {
+                ulong c = list[i].ClientId;
+                if (c == victim.OwnerClientId) continue;
+                if (VoiceClipLibrary.Count(c) == 0) continue;
+                if (!ClipSharing.IsAllowed(c)) continue;
+                candidates.Add(c);
+            }
+            if (candidates.Count == 0) return false;
+
+            float bestD = FarDistance;
+            bool hasFar = false;
+            ulong far = 0;
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                var p = FindPlayer(candidates[i]);
+                if (p == null) continue;
+                float d = FlatDist(p.transform.position, victim.transform.position);
+                if (d > bestD) { bestD = d; far = candidates[i]; hasFar = true; }
+            }
+            if (hasFar) { id = far; return true; }
+
+            ulong cur = targetClientId.Value;
+            id = candidates.Contains(cur) ? cur : candidates[Random.Range(0, candidates.Count)];
+            return true;
         }
+
+        /// <summary>Kimliği uygular. Kimlik değişecekse ve taklitçi görülüyorsa false (değişmez).</summary>
+        bool ApplyIdentity(ulong id)
+        {
+            if (id == targetClientId.Value) return true;
+            if (IsSeen()) return false;
+            SetIdentity(id);
+            return true;
+        }
+
+        // Sessiz deneme (takip sırasında renk/kimlik düzeltme)
+        void TryAdoptIdentityFor(PlayerNetwork victim)
+        {
+            if (ResolveIdentity(victim, out ulong id)) ApplyIdentity(id);
+        }
+
+        // Hareket profili: kurbanın kendi profili asla kullanılmaz
+        MovementProfile ProfileFor(PlayerNetwork victim)
+        {
+            ulong id = targetClientId.Value;
+            if (victim != null && id == victim.OwnerClientId)
+            {
+                var nm = NetworkManager;
+                if (nm != null)
+                {
+                    var list = nm.ConnectedClientsList;
+                    for (int i = 0; i < list.Count; i++)
+                        if (list[i].ClientId != id) return MovementProfiler.Get(list[i].ClientId);
+                }
+                return neutralProfile;
+            }
+            return MovementProfiler.Get(id);
+        }
+
+        // ---------- Sunucu döngüsü ----------
 
         void ServerTick()
         {
@@ -221,7 +399,13 @@ namespace MimicGame.Mimic
             if (pendingSpeakAt > 0f && now >= pendingSpeakAt)
             {
                 pendingSpeakAt = -1f;
-                if (now >= speakCooldownUntil && TrySpeak(true)) speakCooldownUntil = now + Random.Range(6f, 14f);
+                CollectPlayers();
+                var victim = FindPlayer(pendingVictimId) ?? NearestPlayer();
+                if (now >= speakCooldownUntil)
+                {
+                    bool ok = TrySpeak(victim, true, "yanıt", now);
+                    speakCooldownUntil = now + (ok ? Random.Range(5f, 12f) : 2f);
+                }
             }
 
             if (now >= nextDecision)
@@ -241,7 +425,7 @@ namespace MimicGame.Mimic
                 if (all[i] != null && all[i].IsSpawned) tmpPlayers.Add(all[i]);
         }
 
-        static Vector3 Head(PlayerNetwork p)
+        public static Vector3 Head(PlayerNetwork p)
             => p.cameraPivot != null ? p.cameraPivot.position : p.transform.position + Vector3.up * 1.6f;
 
         static float FlatDist(Vector3 a, Vector3 b)
@@ -254,19 +438,25 @@ namespace MimicGame.Mimic
             => Mathf.Abs(p.x - buildingCenter.x) < buildingHalfSize.x - 0.5f &&
                Mathf.Abs(p.z - buildingCenter.z) < buildingHalfSize.y - 0.5f;
 
-        void Decide(float now)
+        PlayerNetwork NearestPlayer()
         {
-            var prof = MovementProfiler.Get(targetClientId.Value);
-            CollectPlayers();
-
-            // En yakın oyuncu
             PlayerNetwork nearest = null;
-            float nearestD = float.MaxValue;
+            float best = float.MaxValue;
             for (int i = 0; i < tmpPlayers.Count; i++)
             {
+                if (tmpPlayers[i] == null) continue;
                 float d = FlatDist(transform.position, tmpPlayers[i].transform.position);
-                if (d < nearestD) { nearestD = d; nearest = tmpPlayers[i]; }
+                if (d < best) { best = d; nearest = tmpPlayers[i]; }
             }
+            return nearest;
+        }
+
+        void Decide(float now)
+        {
+            CollectPlayers();
+            var nearest = NearestPlayer();
+            float nearestD = nearest != null ? FlatDist(transform.position, nearest.transform.position) : float.MaxValue;
+            var prof = ProfileFor(nearest);
 
             // Cezbetme sürüyorsa devam et
             if (mode == Mode.Lure)
@@ -275,21 +465,52 @@ namespace MimicGame.Mimic
                 return;
             }
 
-            // Yeni cezbetme: yalnız kalmış, 25 m içinde bir oyuncu
+            // Yeni cezbetme: yalnız kalmış bir oyuncu
             if (now >= lureCooldownUntil && StartLure(now))
             {
                 UpdateLure(now, prof);
                 return;
             }
 
-            if (nearest != null && nearestD <= 15f)
+            if (nearest != null && nearestD <= FollowRadius)
             {
-                if (mode != Mode.Follow) { mode = Mode.Follow; waiting = false; hasDest = false; nextFollowPath = 0f; }
+                if (mode != Mode.Follow)
+                {
+                    SetMode(Mode.Follow, "oyuncu " + nearest.OwnerClientId + " " + nearestD.ToString("0") + " m");
+                    waiting = false; hasDest = false; nextFollowPath = 0f;
+                    nextFollowSpeak = now + Random.Range(6f, 12f);
+                    followVictim = ulong.MaxValue;
+                }
+                // Kurban değişince (veya kimlik kurbanın kendisiyse) kimliği düzelt
+                if (nearest.OwnerClientId != followVictim)
+                {
+                    followVictim = nearest.OwnerClientId;
+                    nextIdentityTry = now + 1.5f;
+                    TryAdoptIdentityFor(nearest);
+                    prof = ProfileFor(nearest);
+                }
+                else if (targetClientId.Value == nearest.OwnerClientId && now >= nextIdentityTry)
+                {
+                    nextIdentityTry = now + 1.5f;
+                    TryAdoptIdentityFor(nearest);
+                    prof = ProfileFor(nearest);
+                }
                 UpdateFollow(now, prof, nearest);
+
+                if (now >= nextFollowSpeak && now >= speakCooldownUntil)
+                {
+                    nextFollowSpeak = now + Random.Range(12f, 22f);
+                    bool ok = TrySpeak(nearest, false, "takip", now);
+                    speakCooldownUntil = now + (ok ? Random.Range(5f, 12f) : 2f);
+                }
             }
             else
             {
-                if (mode != Mode.Wander) { mode = Mode.Wander; waiting = false; hasDest = false; }
+                if (mode != Mode.Wander)
+                {
+                    SetMode(Mode.Wander, "yakında oyuncu yok");
+                    waiting = false; hasDest = false;
+                }
                 hasLook = false;
                 UpdateWander(now, prof);
             }
@@ -322,16 +543,35 @@ namespace MimicGame.Mimic
             }
         }
 
+        // Çoğunlukla binanın odaları arasında; ara sıra oyuncuların yakınına çıkar
         void PickWanderDestination(MovementProfile prof)
         {
             Vector3 chosen = transform.position;
             bool found = false;
-            for (int i = 0; i < 8 && !found; i++)
+            bool nearPlayer = tmpPlayers.Count > 0 && Random.value < 0.3f;
+            for (int i = 0; i < 10 && !found; i++)
             {
-                var c = transform.position + Random.insideUnitSphere * 15f;
+                Vector3 c;
+                if (nearPlayer)
+                {
+                    var p = tmpPlayers[Random.Range(0, tmpPlayers.Count)];
+                    if (p == null) continue;
+                    Vector2 circ = Random.insideUnitCircle.normalized * Random.Range(10f, 16f);
+                    c = p.transform.position + new Vector3(circ.x, 0f, circ.y);
+                }
+                else
+                {
+                    c = buildingCenter + new Vector3(
+                        Random.Range(-buildingHalfSize.x + 1.5f, buildingHalfSize.x - 1.5f), 0f,
+                        Random.Range(-buildingHalfSize.y + 1.5f, buildingHalfSize.y - 1.5f));
+                }
                 c.y = transform.position.y;
                 if (!NavMesh.SamplePosition(c, out var hit, 3f, NavMesh.AllAreas)) continue;
-                if (InsideBuilding(hit.position) || i == 7) { chosen = hit.position; found = true; }
+                if (FlatDist(hit.position, transform.position) < 3f) continue;
+                if (!NavMesh.CalculatePath(transform.position, hit.position, NavMesh.AllAreas, tmpPath)) continue;
+                if (tmpPath.status != NavMeshPathStatus.PathComplete) continue;
+                chosen = hit.position;
+                found = true;
             }
             if (!found) { waitUntil = Time.time + 1f; waiting = true; return; }
 
@@ -357,6 +597,7 @@ namespace MimicGame.Mimic
             int n = 0;
             for (int i = 0; i < tmpPlayers.Count; i++)
             {
+                if (tmpPlayers[i] == null) continue;
                 if (FlatDist(tmpPlayers[i].transform.position, nearest.transform.position) <= 6f)
                 {
                     centroid += tmpPlayers[i].transform.position;
@@ -392,24 +633,31 @@ namespace MimicGame.Mimic
 
         bool StartLure(float now)
         {
-            ulong tid = targetClientId.Value;
-            if (VoiceClipLibrary.Count(tid) == 0) return false;
-
             for (int i = 0; i < tmpPlayers.Count; i++)
             {
                 var victim = tmpPlayers[i];
-                if (FlatDist(transform.position, victim.transform.position) > 25f) continue;
+                if (victim == null) continue;
+                if (FlatDist(transform.position, victim.transform.position) > LureRange) continue;
 
+                // Yalnız: 8 m içinde başka oyuncu yok
                 bool isolated = true;
                 for (int j = 0; j < tmpPlayers.Count && isolated; j++)
                 {
-                    if (j == i) continue;
-                    if (FlatDist(tmpPlayers[j].transform.position, victim.transform.position) <= 12f) isolated = false;
+                    if (j == i || tmpPlayers[j] == null) continue;
+                    if (FlatDist(tmpPlayers[j].transform.position, victim.transform.position) <= IsolationRadius) isolated = false;
                 }
                 if (!isolated) continue;
 
+                if (!ResolveIdentity(victim, out ulong id)) { Reason("aday yok (çağrı)"); continue; }
+                if (!ApplyIdentity(id))
+                {
+                    Reason("görülüyor (çağrı)");
+                    lureCooldownUntil = now + 5f;
+                    return false;
+                }
                 if (!FindLureSpot(victim, out var spotPos)) continue;
-                mode = Mode.Lure;
+
+                SetMode(Mode.Lure, "kurban " + victim.OwnerClientId + ", kimlik " + id);
                 lureSpot = spotPos;
                 lureVictim = victim.OwnerClientId;
                 lureDeadline = now + 20f;
@@ -418,7 +666,7 @@ namespace MimicGame.Mimic
                 hasDest = false;
                 crouching.Value = false;
                 flashlightOn.Value = false;
-                agent.speed = MovementProfiler.Get(tid).walkSpeed;
+                agent.speed = ProfileFor(victim).walkSpeed;
                 agent.stoppingDistance = 0.5f;
                 agent.SetDestination(lureSpot);
                 return true;
@@ -432,17 +680,16 @@ namespace MimicGame.Mimic
         {
             result = default;
             Vector3 head = Head(victim);
-            var path = new NavMeshPath();
-            for (int i = 0; i < 14; i++)
+            for (int i = 0; i < 20; i++)
             {
                 float ang = Random.value * Mathf.PI * 2f;
-                float r = Random.Range(8f, 12f);
+                float r = Random.Range(6f, 14f);
                 var c = victim.transform.position + new Vector3(Mathf.Cos(ang), 0f, Mathf.Sin(ang)) * r;
                 if (!NavMesh.SamplePosition(c, out var hit, 3f, NavMesh.AllAreas)) continue;
                 // Oyuncunun görüş hattında olmayan nokta
-                if (!Physics.Linecast(head, hit.position + Vector3.up * 1.6f, ~0, QueryTriggerInteraction.Ignore)) continue;
-                if (!NavMesh.CalculatePath(transform.position, hit.position, NavMesh.AllAreas, path)) continue;
-                if (path.status != NavMeshPathStatus.PathComplete) continue;
+                if (HasLineOfSight(head, hit.position + Vector3.up * 1.2f)) continue;
+                if (!NavMesh.CalculatePath(transform.position, hit.position, NavMesh.AllAreas, tmpPath)) continue;
+                if (tmpPath.status != NavMeshPathStatus.PathComplete) continue;
                 result = hit.position;
                 return true;
             }
@@ -452,38 +699,39 @@ namespace MimicGame.Mimic
         void UpdateLure(float now, MovementProfile prof)
         {
             PlayerNetwork victim = FindPlayer(lureVictim);
-            bool arrived = agent.hasPath && !agent.pathPending && agent.remainingDistance <= agent.stoppingDistance + 0.3f;
             if (victim == null || now > lureDeadline) { EndLure(now); return; }
 
             hasLook = true;
             lookPoint = Head(victim);
 
-            if (arrived)
+            bool arrived = FlatDist(transform.position, lureSpot) < 1.5f ||
+                (!agent.pathPending && agent.remainingDistance <= agent.stoppingDistance + 0.3f);
+            if (arrived && !lureSpoken)
             {
-                if (!lureSpoken)
+                // Görülüyorsa konuşmaz; süre dolana kadar her turda tekrar dener
+                if (TrySpeak(victim, true, "çağrı", now))
                 {
                     lureSpoken = true;
-                    TrySpeak(true); // "buraya gel" gibi kısa çağrı
-                    speakCooldownUntil = now + Random.Range(6f, 14f);
-                    lureDeadline = now + 2f;
+                    speakCooldownUntil = now + Random.Range(5f, 12f);
+                    lureDeadline = now + 4f;
                 }
             }
         }
 
         void EndLure(float now)
         {
-            mode = Mode.Wander;
+            SetMode(Mode.Wander, "çağrı bitti");
             waiting = false;
             hasDest = false;
             hasLook = false;
-            lureCooldownUntil = now + Random.Range(20f, 40f);
+            lureCooldownUntil = now + Random.Range(15f, 30f);
             agent.ResetPath();
         }
 
         PlayerNetwork FindPlayer(ulong clientId)
         {
             for (int i = 0; i < tmpPlayers.Count; i++)
-                if (tmpPlayers[i].OwnerClientId == clientId) return tmpPlayers[i];
+                if (tmpPlayers[i] != null && tmpPlayers[i].OwnerClientId == clientId) return tmpPlayers[i];
             return null;
         }
 
@@ -492,19 +740,35 @@ namespace MimicGame.Mimic
         void OnSpeechEnded(ulong clientId, Vector3 speakerPos)
         {
             if (!IsServer || !IsSpawned) return;
-            if (FlatDist(transform.position, speakerPos) > 14f) return;
+            if (FlatDist(transform.position, speakerPos) > ConverseRadius) return;
             if (pendingSpeakAt > 0f || Time.time < speakCooldownUntil) return;
+            pendingVictimId = clientId;
             pendingSpeakAt = Time.time + Random.Range(0.6f, 1.8f);
         }
 
-        bool TrySpeak(bool preferShort)
+        void Reason(string r)
         {
-            ulong tid = targetClientId.Value;
-            var clips = VoiceClipLibrary.GetClips(tid);
-            if (clips.Count == 0) return false;
+            lastReason = r;
+            if (r != lastLoggedReason || Time.time - lastReasonLogTime > 5f)
+            {
+                lastLoggedReason = r;
+                lastReasonLogTime = Time.time;
+                Debug.Log("[Taklitçi] Konuşamıyor: " + r);
+            }
+        }
+
+        bool TrySpeak(PlayerNetwork victim, bool preferShort, string ctx, float now)
+        {
+            if (victim == null) { Reason("kurban yok"); return false; }
+            if (now < speakingUntil) { Reason("zaten konuşuyor"); return false; }
+            if (!ResolveIdentity(victim, out ulong id)) { Reason("aday yok"); return false; }
+            if (!ApplyIdentity(id)) { Reason("görülüyor"); return false; }
+
+            var clips = VoiceClipLibrary.GetClips(id);
+            if (clips.Count == 0) { Reason("klip yok"); return false; }
 
             VoiceClip pick = null;
-            // 1) Kısa + son 3'te yok, 2) herhangi + son 3'te yok, 3) son 1'den farklı
+            // 1) Kısa + son 3'te yok, 2) herhangi + son 3'te yok, 3) herhangi
             for (int pass = 0; pass < 3 && pick == null; pass++)
             {
                 var pool = new List<VoiceClip>();
@@ -512,37 +776,62 @@ namespace MimicGame.Mimic
                 {
                     var c = clips[i];
                     if (pass == 0 && (!preferShort || c.tag != ClipTag.Short)) continue;
-                    bool recent = pass < 2 ? IsRecent(c.id, 3) : IsRecent(c.id, 1);
-                    if (recent) continue;
+                    if (pass < 2 && IsRecent(id, c.id)) continue;
                     pool.Add(c);
                 }
                 if (pool.Count > 0) pick = pool[Random.Range(0, pool.Count)];
             }
-            if (pick == null) return false;
+            if (pick == null) { Reason("klip yok"); return false; }
 
             recentClips[2] = recentClips[1];
             recentClips[1] = recentClips[0];
-            recentClips[0] = pick.id;
-            SpeakRpc(tid, pick.id);
+            recentClips[0] = ClipKey(id, pick.id);
+            speakingUntil = now + pick.duration + 0.3f;
+            lookOverrideId = victim.OwnerClientId;
+            lookOverrideUntil = now + pick.duration + 0.5f;
+            lastReason = "konuştu: " + ctx + ", klip " + pick.id + ", kurban " + victim.OwnerClientId;
+            Debug.Log("[Taklitçi] Konuşuyor: kimlik " + id + ", klip " + pick.id + ", kurban " + victim.OwnerClientId + " (" + ctx + ", " + pick.duration.ToString("0.0") + " sn)");
+            SpeakRpc(id, pick.id);
             return true;
         }
 
-        bool IsRecent(int id, int depth)
+        static long ClipKey(ulong speaker, int clipId) => ((long)(speaker & 0xFFFFFF) << 32) | (uint)clipId;
+
+        bool IsRecent(ulong speaker, int clipId)
         {
-            for (int i = 0; i < depth; i++) if (recentClips[i] == id) return true;
+            long key = ClipKey(speaker, clipId);
+            for (int i = 0; i < recentClips.Length; i++) if (recentClips[i] == key) return true;
             return false;
+        }
+
+        // ---------- Tanı ----------
+
+        public string DebugText()
+        {
+            return mode + " | kimlik: Oyuncu " + targetClientId.Value + " (renk " + colorIndex.Value + ") | ajan: " + (agentReady ? "hazır" : "YOK")
+                + "\n    son konuşma: " + lastReason
+                + "\n    konum: " + transform.position.ToString("F1") + (IsSeen() ? " | görülüyor" : " | görülmüyor");
         }
 
         // ---------- Bakış / dönüş ----------
 
         void UpdateLook()
         {
+            bool look = hasLook;
+            Vector3 lp = lookPoint;
+            // Konuşurken yürümeye devam eder ama kurbana döner
+            if (Time.time < lookOverrideUntil)
+            {
+                var v = FindPlayer(lookOverrideId);
+                if (v != null) { look = true; lp = Head(v); }
+            }
+
             Vector3 dir;
             float targetPitch = 0f;
-            if (hasLook)
+            if (look)
             {
                 Vector3 eye = transform.position + Vector3.up * (shownHeight - EyeOffsetFromTop);
-                Vector3 to = lookPoint - eye;
+                Vector3 to = lp - eye;
                 dir = to;
                 float flat = new Vector2(to.x, to.z).magnitude;
                 targetPitch = Mathf.Clamp(-Mathf.Atan2(to.y, Mathf.Max(0.01f, flat)) * Mathf.Rad2Deg, -45f, 45f);
