@@ -43,8 +43,10 @@ namespace MimicGame.Mimic
         const float IsolationRadius = 8f;   // "yalnız" = başka oyuncu bu kadar yakında değil
         const float FarDistance = 15f;      // "uzaktaki arkadaş" eşiği
         const float SeenRange = 30f;        // kimlik değişimini engelleyen görüş mesafesi
+        const float IdentityHold = 20f;     // kimliği en az bu kadar sn koru
 
         enum Mode { Wander, Follow, Lure }
+        enum ClipPref { Call, Reply }
 
         readonly NetworkVariable<ulong> targetClientId = new NetworkVariable<ulong>(ulong.MaxValue,
             NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
@@ -103,6 +105,7 @@ namespace MimicGame.Mimic
         bool seenCache;
         float seenCacheUntil;
         float nextIdentityTry;
+        float identitySince;
         ulong followVictim = ulong.MaxValue;
         float nextFollowSpeak;
         ulong pendingVictimId = ulong.MaxValue;
@@ -240,6 +243,7 @@ namespace MimicGame.Mimic
         void SetIdentity(ulong id)
         {
             targetClientId.Value = id;
+            identitySince = Time.time;
             colorIndex.Value = ColorFor(id);
             Debug.Log("[Taklitçi] Kimlik: Oyuncu " + id + " (renk " + colorIndex.Value + ")");
         }
@@ -331,6 +335,10 @@ namespace MimicGame.Mimic
             }
             if (candidates.Count == 0) return false;
 
+            // Histerezis: kimlik uygunsa ve yeni değiştiyse koru (kurbanın kendisi adaylarda zaten yok)
+            ulong cur = targetClientId.Value;
+            if (Time.time - identitySince < IdentityHold && candidates.Contains(cur)) { id = cur; return true; }
+
             float bestD = FarDistance;
             bool hasFar = false;
             ulong far = 0;
@@ -343,7 +351,6 @@ namespace MimicGame.Mimic
             }
             if (hasFar) { id = far; return true; }
 
-            ulong cur = targetClientId.Value;
             id = candidates.Contains(cur) ? cur : candidates[Random.Range(0, candidates.Count)];
             return true;
         }
@@ -405,7 +412,7 @@ namespace MimicGame.Mimic
                 var victim = FindPlayer(pendingVictimId) ?? NearestPlayer();
                 if (now >= speakCooldownUntil)
                 {
-                    bool ok = TrySpeak(victim, true, "yanıt", now);
+                    bool ok = TrySpeak(victim, ConverseRadius, false, ClipPref.Reply, "yanıt", now);
                     speakCooldownUntil = now + (ok ? Random.Range(5f, 12f) : 2f);
                 }
             }
@@ -503,7 +510,7 @@ namespace MimicGame.Mimic
                 {
                     // Yanındayken daha sık konuşur
                     nextFollowSpeak = now + (nearestD <= 5f ? Random.Range(5f, 10f) : Random.Range(12f, 22f));
-                    bool ok = TrySpeak(nearest, false, "takip", now);
+                    bool ok = TrySpeak(nearest, FollowRadius, false, ClipPref.Call, "takip", now);
                     speakCooldownUntil = now + (ok ? Random.Range(5f, 12f) : 2f);
                 }
             }
@@ -638,12 +645,17 @@ namespace MimicGame.Mimic
                 }
                 if (!isolated) continue;
 
-                if (!ResolveIdentity(victim, out ulong id)) { Reason("aday yok (çağrı)"); continue; }
-                if (!ApplyIdentity(id))
+                ulong id;
+                if (IsSeen())
                 {
-                    Reason("görülüyor (çağrı)");
-                    lureCooldownUntil = now + 5f;
-                    return false;
+                    // Görülürken kimlik değişmez; kurban kimlikten farklı olmalı
+                    id = targetClientId.Value;
+                    if (id == victim.OwnerClientId || !IsUsable(id)) { Reason("görülüyor (çağrı)"); continue; }
+                }
+                else
+                {
+                    if (!ResolveIdentity(victim, out id)) { Reason("aday yok (çağrı)"); continue; }
+                    if (!ApplyIdentity(id)) { Reason("görülüyor (çağrı)"); continue; }
                 }
                 if (!FindLureSpot(victim, out var spotPos)) continue;
 
@@ -699,7 +711,7 @@ namespace MimicGame.Mimic
             if (arrived && !lureSpoken)
             {
                 // Görülüyorsa konuşmaz; süre dolana kadar her turda tekrar dener
-                if (TrySpeak(victim, true, "çağrı", now))
+                if (TrySpeak(victim, LureRange, true, ClipPref.Call, "çağrı", now))
                 {
                     lureSpoken = true;
                     speakCooldownUntil = now + Random.Range(5f, 12f);
@@ -747,31 +759,66 @@ namespace MimicGame.Mimic
             }
         }
 
-        bool TrySpeak(PlayerNetwork victim, bool preferShort, string ctx, float now)
+        bool IsUsable(ulong id) => ClipSharing.IsAllowed(id) && VoiceClipLibrary.Count(id) > 0;
+
+        PlayerNetwork NearestOther(ulong exceptId, float radius)
+        {
+            PlayerNetwork best = null;
+            float bestD = radius;
+            for (int i = 0; i < tmpPlayers.Count; i++)
+            {
+                var p = tmpPlayers[i];
+                if (p == null || p.OwnerClientId == exceptId) continue;
+                float d = FlatDist(transform.position, p.transform.position);
+                if (d <= bestD) { bestD = d; best = p; }
+            }
+            return best;
+        }
+
+        bool TrySpeak(PlayerNetwork victim, float radius, bool lockVictim, ClipPref pref, string ctx, float now)
         {
             if (victim == null) { Reason("kurban yok"); return false; }
             if (now < speakingUntil) { Reason("zaten konuşuyor"); return false; }
-            if (!ResolveIdentity(victim, out ulong id)) { Reason("aday yok"); return false; }
-            if (!ApplyIdentity(id)) { Reason("görülüyor"); return false; }
+
+            ulong id;
+            if (IsSeen())
+            {
+                // Görülürken kimlik değişmez; kurbanı kimliğe göre seç
+                id = targetClientId.Value;
+                if (!IsUsable(id)) { Reason("görülüyor (kimlik uygun değil)"); return false; }
+                if (victim.OwnerClientId == id)
+                {
+                    victim = lockVictim ? null : NearestOther(id, radius);
+                    if (victim == null) { Reason("kurban yok"); return false; }
+                }
+            }
+            else
+            {
+                if (!ResolveIdentity(victim, out id)) { Reason("aday yok"); return false; }
+                if (!ApplyIdentity(id)) { Reason("görülüyor"); return false; }
+            }
 
             var clips = VoiceClipLibrary.GetClips(id);
-            if (clips.Count == 0) { Reason("klip yok"); return false; }
+            if (clips.Count == 0) { Reason("konuşma klibi yok"); return false; }
 
             VoiceClip pick = null;
-            // 1) Kısa + son 3'te yok, 2) herhangi + son 3'te yok, 3) herhangi
-            for (int pass = 0; pass < 3 && pick == null; pass++)
+            // 1) tercih edilen tür + son 3'te yok, 2) diğer konuşma türü + son 3'te yok,
+            // 3) tercih edilen tür, 4) herhangi konuşma klibi
+            for (int pass = 0; pass < 4 && pick == null; pass++)
             {
                 var pool = new List<VoiceClip>();
                 for (int i = 0; i < clips.Count; i++)
                 {
                     var c = clips[i];
-                    if (pass == 0 && (!preferShort || c.tag != ClipTag.Short)) continue;
+                    if (!c.IsConversational) continue;
+                    bool preferred = pref == ClipPref.Call ? c.isCall : c.isReply;
+                    if ((pass == 0 || pass == 2) && !preferred) continue;
                     if (pass < 2 && IsRecent(id, c.id)) continue;
                     pool.Add(c);
                 }
                 if (pool.Count > 0) pick = pool[Random.Range(0, pool.Count)];
             }
-            if (pick == null) { Reason("klip yok"); return false; }
+            if (pick == null) { Reason("konuşma klibi yok"); return false; }
 
             recentClips[2] = recentClips[1];
             recentClips[1] = recentClips[0];

@@ -135,12 +135,13 @@ namespace MimicGame.Mimic
                 if (m == null) continue;
                 sb.Append(i + 1).Append(") ").AppendLine(m.DebugText());
             }
-            sb.AppendLine("Klip sayıları:");
+            sb.AppendLine("Klip sayıları (çağrı/cevap/toplam):");
             var list = nm.ConnectedClientsList;
             for (int i = 0; i < list.Count; i++)
             {
                 ulong id = list[i].ClientId;
-                sb.Append("  Oyuncu ").Append(id).Append(": ").Append(VoiceClipLibrary.Count(id))
+                sb.Append("  Oyuncu ").Append(id).Append(": ").Append(VoiceClipLibrary.CountCalls(id)).Append('/')
+                  .Append(VoiceClipLibrary.CountReplies(id)).Append('/').Append(VoiceClipLibrary.Count(id))
                   .Append(ClipSharing.IsAllowed(id) ? "" : " (taklit kapalı)").AppendLine();
             }
 
