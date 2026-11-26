@@ -1,14 +1,31 @@
-using System.Collections.Generic;
-using MimicGame.Network;
-using MimicGame.Player;
-using Unity.Netcode;
 using UnityEngine;
 
 namespace MimicGame.Mimic
 {
-    /// <summary>Bir oyuncunun hareket "parmak izi" (üstel hareketli ortalamalar).</summary>
+    /// <summary>Üstel sönümlü olay oranı (olay/dk). Az veri varken öncül (prior) değere yaslanır.</summary>
+    public sealed class RateEma
+    {
+        const float Tau = 420f; // yaklaşık 7 dk hafıza
+        public float events;
+        public float secs;
+
+        public void Tick(float dt)
+        {
+            float f = Mathf.Exp(-dt / Tau);
+            events *= f;
+            secs = secs * f + dt;
+        }
+
+        public void Add(float n = 1f) => events += n;
+
+        /// <summary>Dakikadaki olay sayısı; öncül, yarım dakikalık sanal gözlem gibi karışır.</summary>
+        public float PerMinute(float prior) => (events + prior * 0.5f) / (secs / 60f + 0.5f);
+    }
+
+    /// <summary>Bir oyuncunun hareket "parmak izi" (üstel hareketli ortalamalar ve dağılımlar).</summary>
     public class MovementProfile
     {
+        // ---- Temel (eski) ----
         public float walkSpeed = 3.5f;
         public float sprintSpeed = 6f;
         public float sprintRatio = 0.15f;
@@ -19,102 +36,52 @@ namespace MimicGame.Mimic
         /// <summary>Son ölçülen yatay hız (m/sn).</summary>
         public float currentSpeed;
 
+        // ---- Zengin profil ----
+        /// <summary>Bakış (yaw) dönme hızı ortalaması ve std. sapması (derece/sn, yalnızca dönerken).</summary>
+        public float turnSpeedMean = 140f;
+        public float turnSpeedStd = 70f;
+        /// <summary>Dururken bakış titremesi (derece/sn).</summary>
+        public float lookJitter = 6f;
+        /// <summary>Dakikada geriye bakma sayısı (0.5 sn içinde > 120 derece dönüş).</summary>
+        public float lookBehindPerMin = 0.6f;
+        /// <summary>Dakikada zıplama sayısı.</summary>
+        public float jumpPerMin = 0.5f;
+        /// <summary>Yürürken eğilmiş olma oranı.</summary>
+        public float crouchWalkRatio = 0.1f;
+        /// <summary>Koşu atağı süresi ortalaması (sn).</summary>
+        public float sprintBurstMean = 2.5f;
+        /// <summary>Grupta en yakın oyuncuya tercih edilen mesafe (m).</summary>
+        public float groupDistMean = 3.5f;
+        /// <summary>Grupta konum: diğerinin önüne göre açı (0 = önünde, +-90 yan, 180 arkasında).</summary>
+        public float groupAngleDeg;
+        /// <summary>Grupta geçirilen örnek sayısı (veri güveni).</summary>
+        public int groupSamples;
+        /// <summary>Elde eşya tutma oranı.</summary>
+        public float itemHoldRatio = 0.3f;
+        /// <summary>Dakikada konuşma sayısı.</summary>
+        public float speechPerMin = 3f;
+        /// <summary>Kapıyı kapatma alışkanlığı (0-1).</summary>
+        public float doorCloseRatio = 0.3f;
+        /// <summary>Toplam örnek sayısı.</summary>
+        public int sampleCount;
+
         // Dahili durum
         internal Vector3 lastPos;
         internal bool hasLast;
         internal float stillTimer;
-    }
-
-    /// <summary>Yalnızca sunucuda: her 0.2 sn'de oyuncuları örnekler ve profilleri günceller.</summary>
-    public class MovementProfiler : MonoBehaviour
-    {
-        const float Interval = 0.2f;
-        const float SprintThreshold = 4.5f;
-        const float WalkMin = 0.5f;
-        const float StillThreshold = 0.3f;
-        const float SpeedAlpha = 0.12f;
-        const float RatioAlpha = 0.02f;
-
-        static readonly Dictionary<ulong, MovementProfile> profiles = new Dictionary<ulong, MovementProfile>();
-        static readonly MovementProfile fallback = new MovementProfile();
-
-        float next;
-
-        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
-        static void Create()
-        {
-            if (FindFirstObjectByType<MovementProfiler>() != null) return;
-            var go = new GameObject("MovementProfiler");
-            DontDestroyOnLoad(go);
-            go.AddComponent<MovementProfiler>();
-        }
+        internal float turnVar = 70f * 70f;
+        internal float groupVecX = 1f, groupVecY;
+        internal readonly RateEma lookBehind = new RateEma();
+        internal readonly RateEma jumps = new RateEma();
+        internal readonly RateEma speech = new RateEma();
 
         /// <summary>Oyuncunun profili; veri yoksa varsayılanlarla yeni profil oluşturur.</summary>
-        public static MovementProfile Get(ulong clientId)
-        {
-            if (profiles.TryGetValue(clientId, out var p)) return p;
-            p = new MovementProfile();
-            profiles[clientId] = p;
-            return p;
-        }
+        public static MovementProfile Get(ulong clientId) => BehaviorRecorder.GetProfile(clientId);
+    }
 
-        void Update()
-        {
-            var nm = NetworkManager.Singleton;
-            if (nm == null || !nm.IsServer || !nm.IsListening)
-            {
-                if (profiles.Count > 0) profiles.Clear();
-                return;
-            }
-            if (Time.unscaledTime < next) return;
-            float dt = Time.unscaledTime - next + Interval; // gerçek geçen süre (yaklaşık)
-            next = Time.unscaledTime + Interval;
-            if (dt < 0.05f || dt > 1f) dt = Interval;
-
-            var all = PlayerNetwork.All;
-            for (int i = 0; i < all.Count; i++)
-            {
-                var pn = all[i];
-                if (pn == null || !pn.IsSpawned) continue;
-                if (pn.IsDead) { Get(pn.OwnerClientId).hasLast = false; continue; } // ölüler örneklenmez
-                Sample(pn, Get(pn.OwnerClientId), dt);
-            }
-        }
-
-        static void Sample(PlayerNetwork pn, MovementProfile prof, float dt)
-        {
-            Vector3 pos = pn.transform.position;
-            if (!prof.hasLast) { prof.lastPos = pos; prof.hasLast = true; return; }
-
-            var d = pos - prof.lastPos;
-            d.y = 0f;
-            prof.lastPos = pos;
-            float speed = d.magnitude / dt;
-            if (speed > 20f) return; // ışınlanma sıçramasını yoksay
-            prof.currentSpeed = speed;
-
-            bool crouch = pn.IsCrouchingNet;
-            var fl = pn.GetComponent<Flashlight>();
-            bool light = fl != null && fl.IsOn;
-
-            if (!crouch && speed > WalkMin && speed < SprintThreshold)
-                prof.walkSpeed = Mathf.Lerp(prof.walkSpeed, speed, SpeedAlpha);
-            else if (speed >= SprintThreshold)
-                prof.sprintSpeed = Mathf.Lerp(prof.sprintSpeed, speed, SpeedAlpha);
-
-            prof.sprintRatio = Mathf.Lerp(prof.sprintRatio, speed >= SprintThreshold ? 1f : 0f, RatioAlpha);
-            prof.crouchRatio = Mathf.Lerp(prof.crouchRatio, crouch ? 1f : 0f, RatioAlpha);
-            prof.flashlightRatio = Mathf.Lerp(prof.flashlightRatio, light ? 1f : 0f, RatioAlpha);
-
-            bool still = speed < StillThreshold;
-            prof.stillRatio = Mathf.Lerp(prof.stillRatio, still ? 1f : 0f, RatioAlpha);
-            if (still) prof.stillTimer += dt;
-            else
-            {
-                if (prof.stillTimer > 0.5f)
-                    prof.avgStillDuration = Mathf.Clamp(Mathf.Lerp(prof.avgStillDuration, prof.stillTimer, 0.2f), 0.5f, 8f);
-                prof.stillTimer = 0f;
-            }
-        }
+    /// <summary>Eski ad: yalnızca profil erişimi (örnekleme artık BehaviorRecorder'da).</summary>
+    public static class MovementProfiler
+    {
+        public static MovementProfile Get(ulong clientId) => BehaviorRecorder.GetProfile(clientId);
     }
 }

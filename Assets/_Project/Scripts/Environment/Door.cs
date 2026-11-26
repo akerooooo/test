@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using MimicGame.Interaction;
 using MimicGame.Player;
 using Unity.Netcode;
@@ -16,13 +17,40 @@ namespace MimicGame.Environment
         [Tooltip("Sunucunun kabul edeceği en uzak etkileşim mesafesi.")]
         public float maxUseDistance = 6f;
 
+        [Tooltip("Geçiş noktası (açıklığın ortası); boşsa menteşenin kendisi.")]
+        public Transform passPoint;
+
+        /// <summary>Sahnedeki doğmuş kapılar (taklitçi yapay zekası için).</summary>
+        public static readonly List<Door> All = new List<Door>();
+
+        /// <summary>Sunucu: bir oyuncu kapıyı açtı/kapattı (clientId, şimdi açık mı).</summary>
+        public static event System.Action<ulong, bool> PlayerToggled;
+
         readonly NetworkVariable<bool> isOpen = new NetworkVariable<bool>(false);
 
         public bool IsOpen => isOpen.Value;
+        /// <summary>Kapı açıklığının ortası (dünya).</summary>
+        public Vector3 PassPoint => passPoint != null ? passPoint.position : transform.position;
 
         Quaternion closedRotation;
 
         void Awake() => closedRotation = transform.localRotation;
+
+        public override void OnNetworkSpawn() { if (!All.Contains(this)) All.Add(this); }
+        public override void OnNetworkDespawn() => All.Remove(this);
+
+        public override void OnDestroy()
+        {
+            All.Remove(this);
+            base.OnDestroy();
+        }
+
+        /// <summary>Sunucu: kapıyı açar/kapatır (taklitçi için).</summary>
+        public void ServerSetOpen(bool open)
+        {
+            if (!IsServer || !IsSpawned) return;
+            if (isOpen.Value != open) isOpen.Value = open;
+        }
 
         void Update()
         {
@@ -53,6 +81,7 @@ namespace MimicGame.Environment
                 return;
             }
             isOpen.Value = !isOpen.Value;
+            PlayerToggled?.Invoke(rpcParams.Receive.SenderClientId, isOpen.Value);
         }
     }
 }

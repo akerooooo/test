@@ -37,6 +37,9 @@ namespace MimicGame.Network
             NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Owner);
         readonly NetworkVariable<bool> crouching = new NetworkVariable<bool>(false,
             NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Owner);
+        // Her zıplamada sahip artırır (sunucu davranış kaydı + uzak oyuncuda sıçrama görseli)
+        readonly NetworkVariable<int> jumpCount = new NetworkVariable<int>(0,
+            NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Owner);
 
         // Tesisin içinde mi (sahip yazar; ışınlanınca ve her karede yüksekliğe göre güncellenir)
         readonly NetworkVariable<bool> isInside = new NetworkVariable<bool>(false,
@@ -48,6 +51,10 @@ namespace MimicGame.Network
         /// <summary>Sunucudaki/uzak oyuncuda senkron eğilme durumu.</summary>
         public bool IsCrouchingNet => crouching.Value;
         public int ColorIndex => colorIndex.Value;
+        /// <summary>Senkron bakış eğimi (derece).</summary>
+        public float Pitch => pitch.Value;
+        /// <summary>Toplam zıplama sayısı (sahip artırır).</summary>
+        public int JumpCount => jumpCount.Value;
         /// <summary>Oyuncu tesisin içinde mi (iç mekân haritanın altındadır).</summary>
         public bool IsInside => isInside.Value;
         public Color BodyColor => PlayerAppearance.GetColor(colorIndex.Value);
@@ -58,6 +65,7 @@ namespace MimicGame.Network
         float shownPitch;
         bool pendingTeleport;
         NetworkTransform netTransform;
+        float hopT = 99f;
 
         void Awake()
         {
@@ -74,6 +82,8 @@ namespace MimicGame.Network
             // Renk: sunucu atar, herkes uygular
             if (IsServer) colorIndex.Value = (int)(OwnerClientId % (ulong)PlayerAppearance.Palette.Length);
             colorIndex.OnValueChanged += OnColorChanged;
+            jumpCount.OnValueChanged += OnJumpChanged;
+            if (IsOwner && motor != null) motor.Jumped += OnOwnerJumped;
             PlayerAppearance.ApplyColor(bodyRenderer, colorIndex.Value);
             // Eşyalar oyuncu kapsülüyle çarpışmasın
             foreach (var item in Item.All)
@@ -112,6 +122,8 @@ namespace MimicGame.Network
         {
             All.Remove(this);
             colorIndex.OnValueChanged -= OnColorChanged;
+            jumpCount.OnValueChanged -= OnJumpChanged;
+            if (motor != null) motor.Jumped -= OnOwnerJumped;
 
             // Sunucu: oyuncunun taşıdığı eşyaları ayaklarının altına bırak
             if (IsServer && NetworkManager != null && !NetworkManager.ShutdownInProgress)
@@ -170,6 +182,18 @@ namespace MimicGame.Network
 
         void OnColorChanged(int oldValue, int newValue) => PlayerAppearance.ApplyColor(bodyRenderer, newValue);
 
+        // Sahip zıpladı: sayaç artar (herkes ve sunucu görür)
+        void OnOwnerJumped()
+        {
+            if (IsSpawned && IsOwner) jumpCount.Value++;
+        }
+
+        // Uzak oyuncuda küçük gövde sıçraması başlat
+        void OnJumpChanged(int oldValue, int newValue)
+        {
+            if (!IsOwner) hopT = 0f;
+        }
+
         void SetEnabled<T>(bool on) where T : Behaviour
         {
             var c = GetComponent<T>();
@@ -199,7 +223,8 @@ namespace MimicGame.Network
             float target = crouching.Value ? motor.crouchHeight : motor.standHeight;
             shownHeight = Mathf.MoveTowards(shownHeight, target, motor.crouchTransitionSpeed * Time.deltaTime);
             shownPitch = Mathf.Lerp(shownPitch, pitch.Value, 1f - Mathf.Exp(-20f * Time.deltaTime));
-            ApplyBody(shownHeight);
+            hopT += Time.deltaTime;
+            ApplyBody(shownHeight, PlayerAppearance.HopOffset(hopT));
             if (cameraPivot != null)
             {
                 cameraPivot.localPosition = new Vector3(0f, shownHeight - look.eyeOffsetFromTop, 0f);
@@ -208,6 +233,6 @@ namespace MimicGame.Network
         }
 
         // 2 m'lik kapsül primitifini verilen boya göre ölçekler
-        void ApplyBody(float height) => PlayerAppearance.ApplyBody(body, height);
+        void ApplyBody(float height, float yOffset = 0f) => PlayerAppearance.ApplyBody(body, height, 0.7f, yOffset);
     }
 }

@@ -18,6 +18,7 @@ namespace MimicGame.Level
     /// <summary>Yapay zekâ için oda bilgisi (dünya uzayında).</summary>
     public sealed class RoomInfo
     {
+        public int id;                 // alan kimliği (ışık grubu)
         public RoomKind kind;
         public string theme;
         public Vector3 center;
@@ -83,6 +84,8 @@ namespace MimicGame.Level
 
         [Header("İçerik")]
         public LootTable lootTable;
+        [Tooltip("Oda kapılarının ağ prefabı (builder atar); boşsa iç kapı doğmaz.")]
+        public GameObject interiorDoorPrefab;
         [Tooltip("Toplam oda sayısı (koridor ve merdiven hariç) aralığı.")]
         public int roomsMin = 22;
         public int roomsMax = 30;
@@ -190,6 +193,16 @@ namespace MimicGame.Level
         readonly NetworkVariable<int> seed = new NetworkVariable<int>(0,
             NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
 
+        // Oda ışık grupları (alan kimliği → ışıklar / tüp görselleri); sönük odalar sunucudan senkron
+        readonly Dictionary<int, List<Light>> roomLights = new Dictionary<int, List<Light>>();
+        readonly Dictionary<int, List<Renderer>> roomTubes = new Dictionary<int, List<Renderer>>();
+        readonly NetworkList<int> darkRooms = new NetworkList<int>();
+
+        struct DoorSpot { public Vector3 pos; public float yaw; }
+        readonly List<DoorSpot> doorSpots = new List<DoorSpot>();
+        readonly List<NetworkObject> spawnedDoors = new List<NetworkObject>();
+        bool doorsSpawned;
+
         readonly List<Space> spaces = new List<Space>();
         readonly List<DoorRec> doors = new List<DoorRec>();
         readonly List<Vector3> lootPoints = new List<Vector3>(); // üretici-yerel konumlar (y dahil)
@@ -211,6 +224,7 @@ namespace MimicGame.Level
         {
             Instance = this;
             seed.OnValueChanged += OnSeedChanged;
+            darkRooms.OnListChanged += OnDarkRoomsChanged;
             if (IsServer) seed.Value = NewSeed(); // her sunucu başlangıcında yeni tohum
             TryGenerate();
         }
@@ -218,6 +232,7 @@ namespace MimicGame.Level
         public override void OnNetworkDespawn()
         {
             seed.OnValueChanged -= OnSeedChanged;
+            darkRooms.OnListChanged -= OnDarkRoomsChanged;
             ClearGenerated();
             if (Instance == this) Instance = null;
         }
@@ -258,6 +273,11 @@ namespace MimicGame.Level
             {
                 lootSpawned = true;
                 SpawnLoot();
+            }
+            if (IsServer && Generated && !doorsSpawned)
+            {
+                doorsSpawned = true;
+                SpawnDoors();
             }
 
             if (IsServer && NetworkManager != null && NetworkManager.IsHost && Keyboard.current != null &&
@@ -314,6 +334,7 @@ namespace MimicGame.Level
 
             if (IsServer) RebuildNavMesh();
 
+            ApplyRoomLights();
             Generated = true;
             OnGenerated?.Invoke();
             Debug.Log("[Tesis] Oluşturuldu: tohum " + s + ", " + spaces.Count + " alan, " + lootPoints.Count + " ganimet noktası");
@@ -324,6 +345,12 @@ namespace MimicGame.Level
             Generated = false;
             lootSpawned = false;
             generatedSeed = 0;
+            DespawnDoors();
+            doorsSpawned = false;
+            doorSpots.Clear();
+            roomLights.Clear();
+            roomTubes.Clear();
+            if (IsServer && IsSpawned && NetworkManager != null && !NetworkManager.ShutdownInProgress && darkRooms.Count > 0) darkRooms.Clear();
             MimicSpawns.Clear();
             WanderPoints.Clear();
             Rooms.Clear();
@@ -918,6 +945,7 @@ namespace MimicGame.Level
                 var lc = new Vector3((minX + maxX) * 0.5f, baseY + (height - 0.5f) * 0.5f - 0.25f, (minZ + maxZ) * 0.5f);
                 var info = new RoomInfo
                 {
+                    id = sp.id,
                     kind = sp.kind,
                     theme = ThemeName(sp.kind),
                     center = genRoot.transform.TransformPoint(new Vector3(lc.x, baseY + 0.05f, lc.z)),
@@ -962,6 +990,26 @@ namespace MimicGame.Level
                 DoorPoints.Add(genRoot.transform.TransformPoint(new Vector3(cx, LevelBase[d.lv] + 0.05f, cz)));
             }
             if (MimicSpawns.Count == 0 && WanderPoints.Count > 1) MimicSpawns.Add(WanderPoints[WanderPoints.Count - 1]);
+
+            // İç kapılar: sıradan kapı açıklıklarının ~%50'si (tohumdan deterministik; merdiven komşuluğu hariç)
+            doorSpots.Clear();
+            var drng = new System.Random(generatedSeed ^ 0x0D00F);
+            for (int i = 0; i < doors.Count; i++)
+            {
+                var d = doors[i];
+                if (d.kind != 1) continue;
+                double roll = drng.NextDouble();
+                bool stairNb = (d.a > 0 && spaces[d.a - 1].IsStair) || (d.b > 0 && spaces[d.b - 1].IsStair);
+                if (roll >= 0.5 || stairNb) continue;
+                float cx = d.alongX ? d.start + d.n * 0.5f : d.line;
+                float cz = d.alongX ? d.line : d.start + d.n * 0.5f;
+                var spot = new DoorSpot
+                {
+                    pos = genRoot.transform.TransformPoint(new Vector3(cx, LevelBase[d.lv], cz)),
+                    yaw = genRoot.transform.eulerAngles.y + (d.alongX ? 0f : -90f)
+                };
+                doorSpots.Add(spot);
+            }
         }
 
         static string ThemeName(RoomKind k)
@@ -1014,6 +1062,91 @@ namespace MimicGame.Level
             surface.collectObjects = CollectObjects.All; // iç mekân da dahil
             surface.BuildNavMesh();
             Debug.Log("[Tesis] NavMesh yenilendi.");
+        }
+
+        // ---------- Oda ışıkları ----------
+
+        void RegisterLight(int roomId, Light l)
+        {
+            if (l == null) return;
+            if (!roomLights.TryGetValue(roomId, out var list)) { list = new List<Light>(4); roomLights[roomId] = list; }
+            list.Add(l);
+        }
+
+        void RegisterTube(int roomId, Renderer r)
+        {
+            if (r == null) return;
+            if (!roomTubes.TryGetValue(roomId, out var list)) { list = new List<Renderer>(4); roomTubes[roomId] = list; }
+            list.Add(r);
+        }
+
+        /// <summary>Odanın (alan kimliği) çalışan ışığı var mı.</summary>
+        public bool HasRoomLights(int roomId) => roomLights.ContainsKey(roomId);
+
+        /// <summary>Odanın ışıkları şu an açık mı.</summary>
+        public bool RoomLightsOn(int roomId) => !darkRooms.Contains(roomId);
+
+        /// <summary>Sunucu: odanın ışıklarını açar/söndürür (herkese senkronlanır).</summary>
+        public void ServerSetRoomLights(int roomId, bool on)
+        {
+            if (!IsServer || !IsSpawned) return;
+            bool dark = darkRooms.Contains(roomId);
+            if (on && dark) darkRooms.Remove(roomId);
+            else if (!on && !dark) darkRooms.Add(roomId);
+        }
+
+        void OnDarkRoomsChanged(NetworkListEvent<int> e) => ApplyRoomLights();
+
+        // Tüm ışık gruplarını sönük/açık listeye göre uygular (ışık bileşeni + tüp görseli)
+        void ApplyRoomLights()
+        {
+            foreach (var kv in roomLights)
+            {
+                bool on = !darkRooms.Contains(kv.Key);
+                var list = kv.Value;
+                for (int i = 0; i < list.Count; i++)
+                    if (list[i] != null) list[i].enabled = on;
+            }
+            foreach (var kv in roomTubes)
+            {
+                bool on = !darkRooms.Contains(kv.Key);
+                var mat = on ? stripOnMat : stripOffMat;
+                if (mat == null) continue;
+                var list = kv.Value;
+                for (int i = 0; i < list.Count; i++)
+                    if (list[i] != null) list[i].sharedMaterial = mat;
+            }
+        }
+
+        // ---------- İç kapılar (sunucu) ----------
+
+        void SpawnDoors()
+        {
+            if (interiorDoorPrefab == null) { Debug.LogWarning("[Tesis] İç kapı prefabı atanmamış; iç kapı doğmayacak."); return; }
+            int n = 0;
+            for (int i = 0; i < doorSpots.Count; i++)
+            {
+                var go = Instantiate(interiorDoorPrefab, doorSpots[i].pos, Quaternion.Euler(0f, doorSpots[i].yaw, 0f));
+                var no = go.GetComponent<NetworkObject>();
+                if (no == null) { Destroy(go); continue; }
+                no.Spawn(true);
+                spawnedDoors.Add(no);
+                n++;
+            }
+            Debug.Log("[Tesis] " + n + " iç kapı doğdu.");
+        }
+
+        void DespawnDoors()
+        {
+            var nm = NetworkManager;
+            bool canDespawn = nm != null && nm.IsServer && nm.IsListening && !nm.ShutdownInProgress;
+            for (int i = 0; i < spawnedDoors.Count; i++)
+            {
+                var no = spawnedDoors[i];
+                if (no == null) continue;
+                if (canDespawn && no.IsSpawned) no.Despawn(true);
+            }
+            spawnedDoors.Clear();
         }
 
         // ---------- Ganimet (sunucu) ----------

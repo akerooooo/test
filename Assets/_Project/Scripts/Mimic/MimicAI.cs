@@ -27,6 +27,8 @@ namespace MimicGame.Mimic
         public Transform cameraPivot;
         public Light spot;
         public VoicePlayer voicePlayer;
+        [Tooltip("Sahte eşyanın durduğu el (kamera pivotunun çocuğu); boşsa çalışma anında oluşturulur.")]
+        public Transform hand;
 
         [Header("Bina (tercih edilen bölge)")]
         public Vector3 buildingCenter = new Vector3(0f, 0f, 20f);
@@ -48,12 +50,17 @@ namespace MimicGame.Mimic
         const float FarDistance = 15f;      // "uzaktaki arkadaş" eşiği
         const float SeenRange = 30f;        // kimlik değişimini engelleyen görüş mesafesi
         const float IdentityHold = 20f;     // kimliği en az bu kadar sn koru
+        const float GroupLinkDist = 6f;     // grup: birbirine bu kadar yakın oyuncular zinciri
 
         // Saldırı
-        const float AttackIsolatedRange = 3f;     // yalnız kurbana bu kadar yakın >= 2 sn
-        const float AttackIsolatedTime = 2f;
-        const float AttackBehindRange = 2.2f;     // arkasında >= 1.2 sn
-        const float AttackBehindTime = 1.2f;
+        const float AttackIsolatedRange = 3f;     // yalnız kurbana bu kadar yakın >= 4 sn (ve güven şartı)
+        const float AttackIsolatedTime = 4f;
+        const float AttackBehindRange = 2.2f;     // arkasında >= 2.5 sn
+        const float AttackBehindTime = 2.5f;
+        const float TrustRadius = 6f;             // "yakında" sayılan mesafe
+        const float TrustNeeded = 20f;            // son 2 dk'da yakında geçirilmesi gereken süre (sn)
+        const float TrustBucketSec = 10f;
+        const int TrustBuckets = 12;
         const float AttackBehindAngle = 110f;
         const float WindUpTime = 0.6f;
         const float ChaseSpeed = 5.4f;
@@ -101,9 +108,17 @@ namespace MimicGame.Mimic
         readonly NetworkVariable<bool> revealed = new NetworkVariable<bool>(false,
             NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
 
+        // Kozmetik zıplama sayacı ve sahte elde tutulan eşya (LootTable girdi indeksi, -1 yok)
+        readonly NetworkVariable<int> jumpCount = new NetworkVariable<int>(0,
+            NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+        readonly NetworkVariable<int> fakeHeldItem = new NetworkVariable<int>(-1,
+            NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
         /// <summary>Taklitçinin kimliği (sesini ve rengini kullandığı oyuncu).</summary>
         public ulong TargetClientId => targetClientId.Value;
         public bool Revealed => revealed.Value;
+        /// <summary>Eğilmiş mi (ayak sesi bileşeni için).</summary>
+        public bool IsCrouching => crouching.Value;
 
         static readonly MovementProfile neutralProfile = new MovementProfile();
         static readonly RaycastHit[] losHits = new RaycastHit[32];
@@ -199,6 +214,46 @@ namespace MimicGame.Mimic
         // Açığa çıkma görünümü (her istemcide)
         float revealT;
 
+        // Davranış oynatma (sunucu)
+        readonly BehaviorPlayback playback = new BehaviorPlayback();
+        BehaviorSnippet lastSnippet;
+        int lastJumpPulse;
+        bool lookPlaying, walkSnippetActive, groupPlaying, needRenav, walkCrouch, groupUseProfile;
+        float nextWalkSnippetTry, nextGroupSnippet, nextHabitTick;
+        float turnRate = TurnRate;
+        float glanceUntil, glanceYaw, sprintEndAt = float.MaxValue, walkDesired = 3.5f;
+        ulong groupIdentity = ulong.MaxValue;
+
+        // Kılık kararı
+        ulong pendingDeadId = ulong.MaxValue;
+        string identityWhy = "-";
+        float nextIdentityCheck;
+        string lastDecisionKey = "";
+        float lastDecisionTime = -100f;
+        readonly List<PlayerNetwork> grpTmp = new List<PlayerNetwork>(8);
+
+        // Güven: son 2 dk'da yakında geçirilen süre (10 sn'lik 12 kova)
+        ulong nearestTrustId = ulong.MaxValue;
+        readonly Dictionary<ulong, float[]> trust = new Dictionary<ulong, float[]>();
+        long trustBucket = -1;
+
+        // Kapılar
+        Door pendingDoor;
+        float doorOpenAt;
+        Door lastOpenedDoor;
+        float lastOpenedAt;
+        bool closeRolled;
+
+        // Oda ışıkları
+        int darkenedRoom = -1;
+        float darkenUntil, nextLightsOffAt;
+
+        // Sahte eşya
+        float fakeUntil, nextFakeAt, nextFakeBuild;
+        int fakeShown = -1;
+        GameObject fakeVisual;
+        float hopT = 99f;
+
         // Tanı
         string lastReason = "-";
         string lastLoggedReason = "";
@@ -208,6 +263,13 @@ namespace MimicGame.Mimic
         {
             tmpPath = new NavMeshPath();
             netTransform = GetComponent<NetworkTransform>();
+            if (hand == null && cameraPivot != null)
+            {
+                var h = new GameObject("El");
+                h.transform.SetParent(cameraPivot, false);
+                h.transform.localPosition = new Vector3(0.35f, -0.3f, 0.55f);
+                hand = h.transform;
+            }
             agent = GetComponent<NavMeshAgent>();
             if (agent != null)
             {
@@ -220,6 +282,7 @@ namespace MimicGame.Mimic
             All.Add(this);
             colorIndex.OnValueChanged += OnColorChanged;
             revealed.OnValueChanged += OnRevealedChanged;
+            jumpCount.OnValueChanged += OnJumpChanged;
             ApplyBodyColor();
             revealT = revealed.Value ? 1f : 0f;
             shownHeight = crouching.Value ? CrouchHeight : StandHeight;
@@ -231,8 +294,10 @@ namespace MimicGame.Mimic
             PickInitialIdentity();
             nextRetarget = Time.time + 30f;
             speakCooldownUntil = Time.time + Random.Range(4f, 8f);
-            attackCooldownUntil = Time.time + Random.Range(25f, 45f);
+            attackCooldownUntil = Time.time + Random.Range(90f, 150f); // nadiren saldırır
             lureCooldownUntil = Time.time + Random.Range(10f, 20f);
+            nextFakeAt = Time.time + Random.Range(10f, 30f);
+            nextLightsOffAt = Time.time + Random.Range(120f, 240f);
             groupCooldownUntil = Time.time + Random.Range(8f, 20f);
             nextPickAt = Time.time;
             TryEnableAgent();
@@ -243,8 +308,13 @@ namespace MimicGame.Mimic
             All.Remove(this);
             colorIndex.OnValueChanged -= OnColorChanged;
             revealed.OnValueChanged -= OnRevealedChanged;
+            jumpCount.OnValueChanged -= OnJumpChanged;
             SpeechTracker.SpeechEnded -= OnSpeechEnded;
+            ClearFakeVisual();
+            if (IsServer) RestoreLights();
         }
+
+        void OnJumpChanged(int oldValue, int newValue) => hopT = 0f;
 
         void OnColorChanged(int oldValue, int newValue) => ApplyBodyColor();
         void OnRevealedChanged(bool oldValue, bool newValue) => ApplyBodyColor();
@@ -273,7 +343,9 @@ namespace MimicGame.Mimic
             revealT = Mathf.MoveTowards(revealT, revealed.Value ? 1f : 0f, Time.deltaTime / 0.3f);
             float bodyH = Mathf.Lerp(shownHeight, RevealHeight, revealT);
             float bodyW = Mathf.Lerp(0.7f, RevealWidth, revealT);
-            PlayerAppearance.ApplyBody(body, bodyH, bodyW);
+            hopT += Time.deltaTime;
+            PlayerAppearance.ApplyBody(body, bodyH, bodyW, PlayerAppearance.HopOffset(hopT));
+            ApplyFakeVisual();
             // Açıkken gövde titrer (±2 cm)
             if (revealT > 0.01f && body != null)
                 body.localPosition += Random.insideUnitSphere * (0.02f * revealT);
@@ -364,6 +436,7 @@ namespace MimicGame.Mimic
         void SetActivity(Activity a, string why)
         {
             if (activity == a) return;
+            StopPlayback();
             Debug.Log("[Taklitçi] Etkinlik: " + ActivityNames[(int)activity] + " -> " + ActivityNames[(int)a] + " (" + why + ")");
             if (activity == Activity.Group)
             {
@@ -424,10 +497,13 @@ namespace MimicGame.Mimic
 
         void SetIdentity(ulong id)
         {
+            // Oynatılan parça eski kimliğe aitse bırak (profil/parçalar her zaman güncel kimliğin)
+            if (playback.IsPlaying && playback.Snippet != null && playback.Snippet.owner != id) StopPlayback();
             targetClientId.Value = id;
             identitySince = Time.time;
             colorIndex.Value = ColorFor(id);
-            Debug.Log("[Taklitçi] Kimlik: Oyuncu " + id + " (renk " + colorIndex.Value + ")");
+            Debug.Log("[Taklitçi] Kimlik: Oyuncu " + id + " (renk " + colorIndex.Value + ") - " + identityWhy);
+            identityWhy = "-";
         }
 
         // Doğuşta: kurban henüz yok; klibi olan rastgele bir oyuncu, yoksa herhangi biri
@@ -450,6 +526,7 @@ namespace MimicGame.Mimic
             var free = new List<ulong>(pool.Count);
             for (int i = 0; i < pool.Count; i++) if (!IdentityUsedByOther(pool[i])) free.Add(pool[i]);
             if (free.Count > 0) pool = free;
+            identityWhy = "doğuşta rastgele";
             SetIdentity(pool[Random.Range(0, pool.Count)]);
         }
 
@@ -510,8 +587,9 @@ namespace MimicGame.Mimic
         }
 
         /// <summary>
-        /// Kurban için kimlik seç: kurban dışındaki, klibi olan ve izin veren oyunculardan;
-        /// kurbana >15 m uzaktakilerin en uzağı, yoksa rastgele (mevcut kimlik uygunsa o kalır).
+        /// Kılık kuralı. Kurban V'nin yanındaki grup G (birbirine &lt;= 6 m zincir), G dışındaki canlılar O:
+        /// O boş değilse kimlik O'dan rastgele (G'den uzak olanlar ve başka taklitçinin kullanmadıkları tercih),
+        /// O boşsa G'den V dışında biri. Kurbanın kendisi asla seçilmez. Ölen oyuncunun kılığı her gruba uyar.
         /// Aday yoksa false.
         /// </summary>
         bool ResolveIdentity(PlayerNetwork victim, out ulong id)
@@ -520,44 +598,125 @@ namespace MimicGame.Mimic
             var nm = NetworkManager;
             if (nm == null || victim == null) return false;
 
-            candidates.Clear();
-            var list = nm.ConnectedClientsList;
-            for (int i = 0; i < list.Count; i++)
-            {
-                ulong c = list[i].ClientId;
-                if (c == victim.OwnerClientId) continue;
-                if (VoiceClipLibrary.Count(c) == 0) continue;
-                if (!ClipSharing.IsAllowed(c)) continue;
-                candidates.Add(c);
-            }
-            if (candidates.Count == 0) return false;
-
-            // Başka taklitçilerin kullanmadığı kimlikler tercih edilir
-            if (candidates.Count > 1)
-            {
-                var unused = new List<ulong>(candidates.Count);
-                for (int i = 0; i < candidates.Count; i++) if (!IdentityUsedByOther(candidates[i])) unused.Add(candidates[i]);
-                if (unused.Count > 0) { candidates.Clear(); candidates.AddRange(unused); }
-            }
-
-            // Histerezis: kimlik uygunsa ve yeni değiştiyse koru (kurbanın kendisi adaylarda zaten yok)
+            BuildGroup(victim); // grpTmp = G
             ulong cur = targetClientId.Value;
-            if (Time.time - identitySince < IdentityHold && candidates.Contains(cur)) { id = cur; return true; }
 
-            float bestD = FarDistance;
-            bool hasFar = false;
-            ulong far = 0;
-            for (int i = 0; i < candidates.Count; i++)
+            // Öldürdüğü oyuncunun kılığı: gerçek bir oyuncu olmadığı için her gruba uyar (kurban hariç)
+            if (cur != victim.OwnerClientId && nm.ConnectedClients.ContainsKey(cur) && PlayerHealth.IsDead(cur))
             {
-                var p = FindPlayer(candidates[i]);
-                if (p == null) continue;
-                float d = FlatDist(p.transform.position, victim.transform.position);
-                if (d > bestD) { bestD = d; far = candidates[i]; hasFar = true; }
+                id = cur;
+                return true;
             }
-            if (hasFar) { id = far; return true; }
 
-            id = candidates.Contains(cur) ? cur : candidates[Random.Range(0, candidates.Count)];
-            return true;
+            var all = PlayerNetwork.All;
+            for (int pass = 0; pass < 2; pass++)
+            {
+                bool strict = pass == 0; // önce klibi olan ve izin verenler; yoksa klip şartı gevşer
+                candidates.Clear();
+                for (int i = 0; i < all.Count; i++)
+                {
+                    var p = all[i];
+                    if (p == null || !p.IsSpawned || p.IsDead || grpTmp.Contains(p)) continue;
+                    if (strict && !IsUsable(p.OwnerClientId)) continue;
+                    candidates.Add(p.OwnerClientId);
+                }
+                bool fromOthers = candidates.Count > 0;
+                if (!fromOthers)
+                {
+                    for (int i = 0; i < grpTmp.Count; i++)
+                    {
+                        var p = grpTmp[i];
+                        if (p == null || p == victim) continue;
+                        if (strict && !IsUsable(p.OwnerClientId)) continue;
+                        candidates.Add(p.OwnerClientId);
+                    }
+                }
+                if (candidates.Count == 0) continue;
+
+                // Mevcut kimlik hâlâ kurala uyuyorsa kalır (gereksiz değişim yok)
+                if (candidates.Contains(cur)) { id = cur; return true; }
+
+                // Başka taklitçilerin kullanmadığı kimlikler tercih edilir
+                if (candidates.Count > 1)
+                {
+                    var unused = new List<ulong>(candidates.Count);
+                    for (int i = 0; i < candidates.Count; i++) if (!IdentityUsedByOther(candidates[i])) unused.Add(candidates[i]);
+                    if (unused.Count > 0) { candidates.Clear(); candidates.AddRange(unused); }
+                }
+                // Diğerlerinden seçerken şu an gruptan uzak olanlar tercih edilir
+                if (fromOthers && candidates.Count > 1)
+                {
+                    var far = new List<ulong>(candidates.Count);
+                    for (int i = 0; i < candidates.Count; i++)
+                    {
+                        var p = FindAlive(candidates[i]);
+                        if (p == null) continue;
+                        float minD = float.MaxValue;
+                        for (int j = 0; j < grpTmp.Count; j++)
+                            minD = Mathf.Min(minD, FlatDist(p.transform.position, grpTmp[j].transform.position));
+                        if (minD > FarDistance) far.Add(candidates[i]);
+                    }
+                    if (far.Count > 0) { candidates.Clear(); candidates.AddRange(far); }
+                }
+                id = candidates[Random.Range(0, candidates.Count)];
+                string why = fromOthers ? "grup dışındaki oyunculardan (O)" : "O boş; gruptan kurban dışı (G)";
+                identityWhy = "kılık kuralı: " + why + ", kurban " + victim.OwnerClientId + ", grup " + GroupLabel();
+                string key = victim.OwnerClientId + ">" + id;
+                if (key != lastDecisionKey || Time.time - lastDecisionTime > 8f)
+                {
+                    lastDecisionKey = key;
+                    lastDecisionTime = Time.time;
+                    Debug.Log("[Taklitçi] Kılık kararı: kurban " + victim.OwnerClientId + ", grup " + GroupLabel() + " -> " + id + " (" + why + ")");
+                }
+                return true;
+            }
+            return false;
+        }
+
+        // grpTmp: kurbandan başlayıp birbirine <= GroupLinkDist olan canlı oyuncular zinciri
+        void BuildGroup(PlayerNetwork victim)
+        {
+            grpTmp.Clear();
+            grpTmp.Add(victim);
+            var all = PlayerNetwork.All;
+            bool grew = true;
+            while (grew)
+            {
+                grew = false;
+                for (int i = 0; i < all.Count; i++)
+                {
+                    var p = all[i];
+                    if (p == null || !p.IsSpawned || p.IsDead || grpTmp.Contains(p)) continue;
+                    for (int j = 0; j < grpTmp.Count; j++)
+                    {
+                        if (FlatDist(p.transform.position, grpTmp[j].transform.position) <= GroupLinkDist)
+                        {
+                            grpTmp.Add(p);
+                            grew = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        string GroupLabel()
+        {
+            var sbl = new System.Text.StringBuilder("{");
+            for (int i = 0; i < grpTmp.Count; i++)
+            {
+                if (i > 0) sbl.Append(',');
+                sbl.Append(grpTmp[i].OwnerClientId);
+            }
+            return sbl.Append('}').ToString();
+        }
+
+        static PlayerNetwork FindAlive(ulong clientId)
+        {
+            var all = PlayerNetwork.All;
+            for (int i = 0; i < all.Count; i++)
+                if (all[i] != null && all[i].IsSpawned && !all[i].IsDead && all[i].OwnerClientId == clientId) return all[i];
+            return null;
         }
 
         /// <summary>Kimliği uygular. Kimlik değişecekse ve taklitçi görülüyorsa false (değişmez).</summary>
@@ -574,6 +733,9 @@ namespace MimicGame.Mimic
         {
             if (ResolveIdentity(victim, out ulong id)) ApplyIdentity(id);
         }
+
+        // Mevcut kimliğin profili (kurban yok)
+        MovementProfile CurProfile => ProfileFor(null);
 
         // Hareket profili: kurbanın kendi profili asla kullanılmaz
         MovementProfile ProfileFor(PlayerNetwork victim)
@@ -610,11 +772,16 @@ namespace MimicGame.Mimic
                 if (!agentReady) return;
             }
 
+            TryAdoptDeadIdentity();
+            UpdateFakeItem(now);
+            if (darkenedRoom >= 0 && now >= darkenUntil) RestoreLights();
+
             // Saldırı sürüyorsa normal davranış durur
             if (atk != AttackState.None)
             {
                 pendingSpeakAt = -1f;
                 UpdateAttack(now);
+                UpdateDoors(now, true);
                 UpdateLook();
                 return;
             }
@@ -638,7 +805,323 @@ namespace MimicGame.Mimic
             }
 
             UpdateMovementFeel(now, Time.deltaTime);
+            TickPlayback(now);
+            UpdateDoors(now, false);
+            UpdateHabits(now);
             UpdateLook();
+        }
+
+        // ---------- Davranış oynatma ----------
+
+        void StopPlayback()
+        {
+            if (playback.IsPlaying) playback.Stop();
+            AfterPlayback();
+            lookPlaying = false;
+            groupPlaying = false;
+        }
+
+        // Oynatma bitti (doğal ya da iptal): yürüyüş parçasıysa hedefe yeniden yönel
+        void AfterPlayback()
+        {
+            if (walkSnippetActive)
+            {
+                needRenav = true;
+                if (crouching.Value != walkCrouch) crouching.Value = walkCrouch;
+            }
+            walkSnippetActive = false;
+        }
+
+        void TickPlayback(float now)
+        {
+            if (!playback.IsPlaying) return;
+            if (!playback.Tick(now))
+            {
+                AfterPlayback();
+                return;
+            }
+            if (crouching.Value != playback.Crouch) crouching.Value = playback.Crouch;
+            if (flashlightOn.Value != playback.Flashlight) flashlightOn.Value = playback.Flashlight;
+            while (lastJumpPulse < playback.JumpPulse) { lastJumpPulse++; jumpCount.Value++; }
+        }
+
+        bool BeginPlayback(BehaviorSnippet s, float now, float baseYaw, float pitchOffset, bool allowMove, bool requireMove)
+        {
+            if (!playback.Begin(s, transform, agent, now, baseYaw, pitchOffset, allowMove, requireMove)) return false;
+            lastSnippet = s;
+            lastJumpPulse = playback.JumpPulse;
+            Debug.Log("[Taklitçi] Davranış oynatılıyor: " + BehaviorRecorder.TagName(s.tag) + ", oyuncu " + s.owner + ", "
+                + s.duration.ToString("0.0") + " sn" + (playback.Moving ? ", yolla" : ", yerinde"));
+            return true;
+        }
+
+        /// <summary>F9 paneli: oynatılan parça.</summary>
+        public string PlaybackLabel => playback.Label;
+
+        /// <summary>F9 paneli: sahte eşya.</summary>
+        public string FakeItemLabel => fakeHeldItem.Value < 0 ? "yok" : "#" + fakeHeldItem.Value;
+
+        // ---------- Yürüyüş alışkanlıkları (profilden) ----------
+
+        // Yürürken: geriye bakma, zıplama (kozmetik)
+        void UpdateHabits(float now)
+        {
+            if (now < nextHabitTick) return;
+            nextHabitTick = now + 0.25f;
+            if (revealed.Value || playback.IsPlaying) return;
+            bool walking = (activity == Activity.Explore && exState == ExploreState.Walk) || activity == Activity.Group;
+            if (!walking || !agent.isOnNavMesh || agent.velocity.sqrMagnitude < 1f) return;
+
+            var prof = CurProfile;
+            if (now > glanceUntil + 4f && Random.value < Mathf.Clamp(prof.lookBehindPerMin, 0f, 6f) / 60f * 0.25f)
+            {
+                glanceUntil = now + Random.Range(0.5f, 0.9f);
+                Vector3 v = agent.velocity; v.y = 0f;
+                float yaw = Mathf.Atan2(v.x, v.z) * Mathf.Rad2Deg;
+                glanceYaw = yaw + 180f + Random.Range(-40f, 40f);
+            }
+            if (Random.value < Mathf.Clamp(prof.jumpPerMin, 0f, 8f) / 60f * 0.25f)
+                jumpCount.Value++;
+        }
+
+        // ---------- Kapılar ----------
+
+        // Yolu kapalı bir kapıdan geçiyorsa: 0.4 sn durur, açar, yürür; bazen arkasından kapatır (kimliğin alışkanlığı)
+        void UpdateDoors(float now, bool instant)
+        {
+            if (pendingDoor != null)
+            {
+                if (agent.isOnNavMesh) agent.isStopped = true;
+                playback.Paused = true;
+                if (now < doorOpenAt) return;
+                pendingDoor.ServerSetOpen(true);
+                lastOpenedDoor = pendingDoor;
+                lastOpenedAt = now;
+                closeRolled = false;
+                pendingDoor = null;
+                playback.Paused = false;
+                if (agent.isOnNavMesh) agent.isStopped = false;
+                return;
+            }
+
+            Vector3 pos = transform.position;
+            var doors = Door.All;
+            bool moving = agent.isOnNavMesh && agent.hasPath && !agent.pathPending && agent.velocity.sqrMagnitude > 0.04f;
+            if (moving)
+            {
+                Vector3 dirMove = agent.steeringTarget - pos;
+                dirMove.y = 0f;
+                for (int i = 0; i < doors.Count; i++)
+                {
+                    var d = doors[i];
+                    if (d == null || !d.IsSpawned || d.IsOpen) continue;
+                    Vector3 to = d.PassPoint - pos;
+                    if (Mathf.Abs(to.y) > 2f) continue;
+                    to.y = 0f;
+                    float dist = to.magnitude;
+                    if (dist > 1.5f) continue;
+                    if (dist > 0.1f && dirMove.sqrMagnitude > 0.01f && Vector3.Dot(dirMove.normalized, to / dist) < 0.2f) continue;
+                    if (instant)
+                    {
+                        d.ServerSetOpen(true);
+                        lastOpenedDoor = d;
+                        lastOpenedAt = now;
+                        closeRolled = true;
+                        return;
+                    }
+                    pendingDoor = d;
+                    doorOpenAt = now + 0.4f;
+                    pauseUntil = Mathf.Max(pauseUntil, doorOpenAt);
+                    agent.isStopped = true;
+                    playback.Paused = true;
+                    Debug.Log("[Taklitçi] Kapalı kapıya geldi; açacak.");
+                    return;
+                }
+            }
+
+            if (lastOpenedDoor != null && !closeRolled)
+            {
+                if (!lastOpenedDoor.IsSpawned || !lastOpenedDoor.IsOpen) { lastOpenedDoor = null; return; }
+                float dd = Vector3.Distance(lastOpenedDoor.PassPoint, pos);
+                if (dd > 2.5f)
+                {
+                    closeRolled = true;
+                    float p = Mathf.Clamp(CurProfile.doorCloseRatio, 0.05f, 0.9f);
+                    if (Random.value < p && !AnyPlayerNear(lastOpenedDoor.PassPoint, 1.5f))
+                    {
+                        lastOpenedDoor.ServerSetOpen(false);
+                        Debug.Log("[Taklitçi] Geçtikten sonra kapıyı kapattı.");
+                    }
+                    lastOpenedDoor = null;
+                }
+                else if (now - lastOpenedAt > 20f) lastOpenedDoor = null;
+            }
+            else if (lastOpenedDoor != null && now - lastOpenedAt > 3f) lastOpenedDoor = null;
+        }
+
+        static bool AnyPlayerNear(Vector3 pos, float radius)
+        {
+            var all = PlayerNetwork.All;
+            for (int i = 0; i < all.Count; i++)
+            {
+                var p = all[i];
+                if (p == null || !p.IsSpawned || p.IsDead) continue;
+                if (Vector3.Distance(p.transform.position, pos) < radius) return true;
+            }
+            return false;
+        }
+
+        // ---------- Oda ışıkları ----------
+
+        // Yalnız oyuncuyu çağırırken, görülmüyorsa, nadiren (3-5 dk bekleme) onun odasının ışıklarını söndürür
+        void TryDarkenRoom(PlayerNetwork victim, float now)
+        {
+            var gen = FacilityGenerator.Instance;
+            if (gen == null || !FacilityGenerator.Generated || now < nextLightsOffAt) return;
+            if (!victim.IsInside || IsSeen()) return;
+            if (Random.value > 0.4f) return;
+            var room = FacilityGenerator.RoomAt(victim.transform.position);
+            if (room == null || !gen.HasRoomLights(room.id) || !gen.RoomLightsOn(room.id)) return;
+            RestoreLights();
+            gen.ServerSetRoomLights(room.id, false);
+            darkenedRoom = room.id;
+            darkenUntil = now + Random.Range(35f, 70f);
+            nextLightsOffAt = now + Random.Range(180f, 300f);
+            Debug.Log("[Taklitçi] Işıkları söndürdü: oda " + room.id + " (" + room.theme + "), kurban " + victim.OwnerClientId);
+        }
+
+        void RestoreLights()
+        {
+            if (darkenedRoom < 0) return;
+            var gen = FacilityGenerator.Instance;
+            if (gen != null) gen.ServerSetRoomLights(darkenedRoom, true);
+            darkenedRoom = -1;
+        }
+
+        // ---------- Öldürünce kılık değiştirme ----------
+
+        // Görülmüyorsa hemen (açığa çıkmışken renk zaten görünmez) ölen oyuncunun kılığına girer
+        void TryAdoptDeadIdentity()
+        {
+            if (pendingDeadId == ulong.MaxValue) return;
+            if (pendingDeadId == targetClientId.Value) { pendingDeadId = ulong.MaxValue; return; }
+            var nm = NetworkManager;
+            if (nm == null || !nm.ConnectedClients.ContainsKey(pendingDeadId)) { pendingDeadId = ulong.MaxValue; return; }
+            if (!revealed.Value && IsSeen()) return;
+            ulong id = pendingDeadId;
+            pendingDeadId = ulong.MaxValue;
+            identityWhy = "ölünün kılığı (öldürme sonrası)";
+            SetIdentity(id);
+            Debug.Log("[Taklitçi] Öldürdüğü oyuncunun kılığına girdi: Oyuncu " + id);
+        }
+
+        // ---------- Sahte eşya ----------
+
+        // Kimliğin eşya tutma oranına göre 30-120 sn boyunca elinde sahte (yalnızca görsel) eşya taşır
+        void UpdateFakeItem(float now)
+        {
+            if (atk != AttackState.None || revealed.Value)
+            {
+                if (fakeHeldItem.Value >= 0) fakeHeldItem.Value = -1;
+                return;
+            }
+            if (fakeHeldItem.Value >= 0)
+            {
+                if (now >= fakeUntil)
+                {
+                    fakeHeldItem.Value = -1;
+                    nextFakeAt = now + Random.Range(10f, 40f);
+                    Debug.Log("[Taklitçi] Sahte eşyayı bıraktı.");
+                }
+                return;
+            }
+            if (now < nextFakeAt) return;
+            nextFakeAt = now + Random.Range(10f, 25f);
+
+            var gen = FacilityGenerator.Instance;
+            var table = gen != null ? gen.lootTable : null;
+            if (table == null || table.entries == null || table.entries.Length == 0) return;
+            if (Random.value > Mathf.Clamp(CurProfile.itemHoldRatio, 0.05f, 0.9f)) return;
+
+            float total = 0f;
+            for (int i = 0; i < table.entries.Length; i++)
+                if (table.entries[i].prefab != null) total += Mathf.Max(0f, table.entries[i].weight);
+            if (total <= 0f) return;
+            float r = Random.value * total;
+            int idx = -1;
+            for (int i = 0; i < table.entries.Length; i++)
+            {
+                if (table.entries[i].prefab == null) continue;
+                idx = i;
+                r -= Mathf.Max(0f, table.entries[i].weight);
+                if (r <= 0f) break;
+            }
+            if (idx < 0) return;
+            fakeHeldItem.Value = idx;
+            fakeUntil = now + Random.Range(30f, 120f);
+            Debug.Log("[Taklitçi] Sahte eşya aldı: " + table.entries[idx].prefab.name + " (" + (fakeUntil - now).ToString("0") + " sn)");
+        }
+
+        // Her istemci: elde sahte eşyanın yalnızca görselini (Görsel/Model alt nesnesi ya da ilkel mesh) gösterir
+        void ApplyFakeVisual()
+        {
+            int want = revealed.Value ? -1 : fakeHeldItem.Value;
+            if (want == fakeShown) return;
+            if (want < 0)
+            {
+                ClearFakeVisual();
+                fakeShown = -1;
+                return;
+            }
+            if (Time.time < nextFakeBuild) return;
+            nextFakeBuild = Time.time + 1f;
+            ClearFakeVisual();
+            if (BuildFakeVisual(want)) fakeShown = want;
+        }
+
+        void ClearFakeVisual()
+        {
+            if (fakeVisual != null) Destroy(fakeVisual);
+            fakeVisual = null;
+            fakeShown = -1;
+        }
+
+        bool BuildFakeVisual(int idx)
+        {
+            var gen = FacilityGenerator.Instance;
+            var table = gen != null ? gen.lootTable : null;
+            if (table == null || table.entries == null) return false; // henüz hazır değil; tekrar dener
+            if (idx < 0 || idx >= table.entries.Length || hand == null) return true;
+            var prefab = table.entries[idx].prefab;
+            if (prefab == null) return true;
+
+            GameObject vis = null;
+            Transform src = prefab.transform.Find("Görsel");
+            if (src == null) src = prefab.transform.Find("Model");
+            if (src != null) vis = Instantiate(src.gameObject, hand);
+            else
+            {
+                var mf = prefab.GetComponentInChildren<MeshFilter>();
+                var mr = prefab.GetComponentInChildren<MeshRenderer>();
+                if (mf != null && mr != null && mf.sharedMesh != null)
+                {
+                    vis = new GameObject("Sahte Eşya");
+                    vis.transform.SetParent(hand, false);
+                    vis.transform.localPosition = mf.transform.localPosition;
+                    vis.transform.localRotation = mf.transform.localRotation;
+                    vis.transform.localScale = mf.transform.localScale;
+                    vis.AddComponent<MeshFilter>().sharedMesh = mf.sharedMesh;
+                    vis.AddComponent<MeshRenderer>().sharedMaterials = mr.sharedMaterials;
+                }
+            }
+            if (vis == null) return true;
+            vis.name = "Sahte Eşya";
+            vis.SetActive(true);
+            // Yalnızca görsel: çarpıştırıcı, betik ve ağ bileşeni yok
+            foreach (var c in vis.GetComponentsInChildren<Collider>(true)) { c.enabled = false; Destroy(c); }
+            foreach (var b in vis.GetComponentsInChildren<MonoBehaviour>(true)) Destroy(b);
+            fakeVisual = vis;
+            return true;
         }
 
         void CollectPlayers()
@@ -687,9 +1170,23 @@ namespace MimicGame.Mimic
             var nearest = NearestPlayer();
             float nearestD = nearest != null ? FlatDist(transform.position, nearest.transform.position) : float.MaxValue;
             var prof = ProfileFor(nearest);
+            turnRate = Mathf.Clamp(prof.turnSpeedMean * 2.2f, 180f, 540f);
 
             // Saldırı tetikleri (bekleme bittiyse)
             if (CheckAttackTriggers(now, nearest, nearestD)) return;
+
+            // Yaklaştığı grup değiştiyse kılık yeni gruba uyar (yalnızca görülmüyorken; ApplyIdentity kontrol eder)
+            if (now >= nextIdentityCheck)
+            {
+                nextIdentityCheck = now + 2.5f;
+                if (activity != Activity.Lure && nearest != null && nearestD <= FollowRadius + 6f)
+                {
+                    // Grupta ise yaklaştığı kişi grup hedefidir (kurban); değilse en yakın oyuncu
+                    var vic = activity == Activity.Group ? (FindPlayer(groupTarget) ?? nearest) : nearest;
+                    TryAdoptIdentityFor(vic);
+                    prof = ProfileFor(vic);
+                }
+            }
 
             UpdateZonePlan(now);
 
@@ -856,9 +1353,15 @@ namespace MimicGame.Mimic
             exState = ExploreState.Walk;
             exTimeout = now + 70f;
             bool sprint = Random.value < Mathf.Min(0.35f, prof.sprintRatio * 1.5f);
-            bool crouch = !sprint && Random.value < prof.crouchRatio * 0.5f;
+            bool crouch = !sprint && Random.value < Mathf.Clamp(prof.crouchWalkRatio, 0f, 0.6f);
             float walk = Mathf.Clamp(prof.walkSpeed, 1.8f, 4.5f);
+            walkDesired = crouch ? 1.8f : walk;
             desiredSpeed = crouch ? 1.8f : (sprint ? Mathf.Clamp(prof.sprintSpeed, 4.6f, 6.5f) : walk);
+            // Koşu atağı: kimliğin ortalama atak süresi kadar koşar, sonra yürür
+            sprintEndAt = sprint ? now + Mathf.Clamp(prof.sprintBurstMean * Random.Range(0.7f, 1.3f), 0.8f, 15f) : float.MaxValue;
+            walkCrouch = crouch;
+            walkSnippetActive = false;
+            needRenav = false;
             crouching.Value = crouch;
             flashlightOn.Value = WantsFlashlight(exDest, prof);
             hasLook = false;
@@ -885,11 +1388,25 @@ namespace MimicGame.Mimic
 
         void UpdateWalk(float now, MovementProfile prof)
         {
-            if (now > exTimeout) { agent.ResetPath(); exState = ExploreState.Pick; nextPickAt = now; return; }
+            if (now > exTimeout) { StopPlayback(); agent.ResetPath(); exState = ExploreState.Pick; nextPickAt = now; return; }
+            // Yürüyüş parçası oynuyorsa onu sürdür; bitince hedefe yeniden yönel
+            if (walkSnippetActive && playback.IsPlaying) return;
+            if (needRenav)
+            {
+                needRenav = false;
+                NavigateToGoal();
+                return;
+            }
+            if (desiredSpeed > SprintThreshold && now >= sprintEndAt) desiredSpeed = walkDesired;
             // Bölge planı vaktiyse yürüyüşü bırakıp öteki bölgeye yeni hedef seç
             if (!exViaDoor && exDestInside == SelfInside && PlanDue(now)) { exState = ExploreState.Pick; nextPickAt = now; return; }
             if (agent.pathPending) return;
             if (agent.pathStatus == NavMeshPathStatus.PathInvalid) { agent.ResetPath(); exState = ExploreState.Pick; nextPickAt = now + 0.5f; return; }
+            if (!exViaDoor && agent.hasPath && now >= nextWalkSnippetTry)
+            {
+                nextWalkSnippetTry = now + Random.Range(6f, 14f);
+                if (TryPlayWalkSnippet(now, prof)) return;
+            }
             if (!agent.hasPath)
             {
                 // Yol kayboldu: yeniden dene; zaten hedefe yakınsa varmış say
@@ -922,6 +1439,37 @@ namespace MimicGame.Mimic
                 if (door != null) lookPoint = door.transform.position + Vector3.up * 1.5f;
             }
             else BeginLookAround(now, prof);
+        }
+
+        // Yürürken kimliğin Yürüyüş/Kapı/Merdiven parçasını uygunsa oynatır (yön, yola hizalanır; yol NavMesh'te geçerli olmalı)
+        bool TryPlayWalkSnippet(float now, MovementProfile prof)
+        {
+            if (Random.value > 0.35f) return false;
+            Vector3 heading = agent.steeringTarget - transform.position;
+            float dy = heading.y;
+            heading.y = 0f;
+            if (heading.magnitude < 1f) return false;
+            float headYaw = Mathf.Atan2(heading.x, heading.z) * Mathf.Rad2Deg;
+
+            SnippetTag tag = SnippetTag.Walk;
+            if (NearestDoorIndex(transform.position, 3.5f) >= 0) tag = SnippetTag.Door;
+            else if (Mathf.Abs(dy) > 0.8f) tag = SnippetTag.Stairs;
+
+            ulong id = targetClientId.Value;
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                var s = BehaviorRecorder.Pick(id, tag, lastSnippet);
+                if (s == null) return false;
+                if (s.netDist > agent.remainingDistance - 1.5f) continue; // hedefi aşmasın
+                // parçanın net yönü yolun yönüne hizalanır
+                float baseYaw = headYaw - s.netYawDeg;
+                if (BeginPlayback(s, now, baseYaw, 0f, true, true))
+                {
+                    walkSnippetActive = true;
+                    return true;
+                }
+            }
+            return false;
         }
 
         Vector3 GoalDoorFront()
@@ -981,18 +1529,36 @@ namespace MimicGame.Mimic
             hasLook = false;
             crouching.Value = Random.value < Mathf.Clamp(prof.crouchRatio, 0.05f, 0.5f);
             flashlightOn.Value = WantsFlashlight(transform.position, prof);
+
+            // Kimliğin kaydedilmiş "etrafa bakma" parçası varsa birebir oynat (yerinde durarak)
+            lookPlaying = false;
+            var s = BehaviorRecorder.Pick(targetClientId.Value, SnippetTag.LookAround, lastSnippet);
+            if (s != null && BeginPlayback(s, now, transform.eulerAngles.y, 0f, false, false))
+            {
+                lookPlaying = true;
+                lookEnd = now + s.duration;
+                freeLookOn = false;
+            }
         }
 
         void UpdateLookAround(float now, MovementProfile prof)
         {
-            if (now >= nextLookStep)
+            if (lookPlaying)
             {
-                nextLookStep = now + Random.Range(0.7f, 1.6f);
-                freeLookYaw += Random.Range(-110f, 110f);
-                // yukarı raflar (negatif) ya da köşe / zemin (pozitif)
-                freeLookPitch = Random.value < 0.35f ? Random.Range(-25f, -8f) : Random.Range(5f, 28f);
+                if (playback.IsPlaying) return;
+                lookPlaying = false;
             }
-            if (now < lookEnd) return;
+            else
+            {
+                if (now >= nextLookStep)
+                {
+                    nextLookStep = now + Random.Range(0.7f, 1.6f);
+                    freeLookYaw += Random.Range(-110f, 110f);
+                    // yukarı raflar (negatif) ya da köşe / zemin (pozitif)
+                    freeLookPitch = Random.value < 0.35f ? Random.Range(-25f, -8f) : Random.Range(5f, 28f);
+                }
+                if (now < lookEnd) return;
+            }
 
             freeLookOn = false;
             if (crouching.Value) crouching.Value = false;
@@ -1079,8 +1645,9 @@ namespace MimicGame.Mimic
             groupTarget = p.OwnerClientId;
             groupStart = now;
             groupUntil = now + Random.Range(15f, 40f);
-            groupDist = Random.Range(3f, 5f);
-            groupAngle = Random.Range(-50f, 50f);
+            TryAdoptIdentityFor(p); // kimlik kurbanın kendisiyse / gruba uymuyorsa değiştir (görülmüyorsa)
+            RefreshGroupHabits(p);
+            nextGroupSnippet = now + Random.Range(0.5f, 2f);
             groupApproaching = true;
             nextGroupPath = 0f;
             nextGroupLook = now + Random.Range(1f, 3f);
@@ -1090,14 +1657,55 @@ namespace MimicGame.Mimic
             nextIdentityTry = now + 1.5f;
             followTimeVictim = p.OwnerClientId;
             followTime = 0f;
-            followLimit = Random.Range(25f, 70f);
+            followLimit = Random.Range(120f, 180f); // sabırsızlanma: nadiren saldırır
             exState = ExploreState.Pick;
             exViaDoor = false;
             hasLook = false;
             freeLookOn = false;
             agent.stoppingDistance = 0.4f;
             agent.isStopped = false;
-            TryAdoptIdentityFor(p); // kimlik kurbanın kendisiyse değiştir
+        }
+
+        // Grup mesafesi / konumu: kimliğin profilinde yeterli veri varsa onun tercihi, yoksa rastgele
+        void RefreshGroupHabits(PlayerNetwork p)
+        {
+            var gp = ProfileFor(p);
+            groupIdentity = targetClientId.Value;
+            groupUseProfile = gp.groupSamples >= 15;
+            if (groupUseProfile)
+            {
+                groupDist = Mathf.Clamp(gp.groupDistMean + Random.Range(-0.4f, 0.4f), 2f, 6f);
+                groupAngle = gp.groupAngleDeg + Random.Range(-15f, 15f);
+            }
+            else
+            {
+                groupDist = Random.Range(3f, 5f);
+                groupAngle = Random.Range(-50f, 50f);
+            }
+        }
+
+        // Gruptaki oyuncuların ortalama bakış yönü (yaw) ve eğimi
+        bool GroupForward(PlayerNetwork p, out float yaw, out float pitchDeg)
+        {
+            yaw = 0f; pitchDeg = 0f;
+            Vector3 sum = Vector3.zero;
+            float pitchSum = 0f;
+            int n = 0;
+            for (int i = 0; i < tmpPlayers.Count; i++)
+            {
+                var q = tmpPlayers[i];
+                if (q == null) continue;
+                if (q != p && FlatDist(q.transform.position, p.transform.position) > GroupLinkDist) continue;
+                Vector3 f = q.transform.forward; f.y = 0f;
+                if (f.sqrMagnitude < 0.01f) continue;
+                sum += f.normalized;
+                pitchSum += q.Pitch;
+                n++;
+            }
+            if (n == 0 || sum.sqrMagnitude < 0.05f) return false;
+            yaw = Mathf.Atan2(sum.x, sum.z) * Mathf.Rad2Deg;
+            pitchDeg = pitchSum / n;
+            return true;
         }
 
         void UpdateGroup(float now)
@@ -1122,6 +1730,7 @@ namespace MimicGame.Mimic
                 prof = ProfileFor(p);
             }
 
+            if (groupIdentity != targetClientId.Value) RefreshGroupHabits(p); // kimlik değişti: yeni kimliğin tercihleri
             if (!groupApproaching && d > groupDist + 1.8f) groupApproaching = true;
             if (groupApproaching && d <= groupDist + 0.8f) { groupApproaching = false; agent.ResetPath(); }
 
@@ -1129,6 +1738,7 @@ namespace MimicGame.Mimic
             {
                 float ps = MovementProfiler.Get(p.OwnerClientId).currentSpeed;
                 desiredSpeed = ps > SprintThreshold ? prof.sprintSpeed : Mathf.Clamp(prof.walkSpeed, 1.8f, 4.5f);
+                if (playback.IsPlaying) StopPlayback(); // uzaklaştıysa grupta bekleme parçası bırakılır
                 if (crouching.Value) crouching.Value = false;
                 freeLookOn = false;
                 hasLook = d < 7f;
@@ -1139,38 +1749,73 @@ namespace MimicGame.Mimic
                     Vector3 toM = transform.position - p.transform.position;
                     toM.y = 0f;
                     if (toM.sqrMagnitude < 0.01f) toM = -p.transform.forward;
-                    Vector3 want = p.transform.position + Quaternion.Euler(0f, groupAngle, 0f) * toM.normalized * groupDist;
+                    Vector3 want;
+                    if (groupUseProfile)
+                    {
+                        // kimliğin tercih ettiği konum: grubun yönüne göre açı (0 = önünde, 180 = arkasında)
+                        Vector3 pf = p.transform.forward; pf.y = 0f;
+                        if (pf.sqrMagnitude < 0.01f) pf = Vector3.forward;
+                        want = p.transform.position + Quaternion.Euler(0f, groupAngle, 0f) * pf.normalized * groupDist;
+                    }
+                    else want = p.transform.position + Quaternion.Euler(0f, groupAngle, 0f) * toM.normalized * groupDist;
                     if (NavMesh.SamplePosition(want, out var hit, 3f, NavMesh.AllAreas)) agent.SetDestination(hit.position);
                 }
                 return;
             }
 
-            // Yanında bir oyuncu gibi durur: küçük bakış değişimleri, çömelme, el feneri, konuşma
+            // Yanında bir oyuncu gibi durur: kimliğin "grupta bekleme" parçası ya da küçük bakış değişimleri, çömelme, el feneri
             if (agent.hasPath) agent.ResetPath();
-            if (now >= nextGroupLook)
+            if (groupPlaying && !playback.IsPlaying)
             {
-                nextGroupLook = now + Random.Range(1.5f, 4f);
-                if (Random.value < 0.6f) { hasLook = true; lookPoint = Head(p); freeLookOn = false; }
-                else
+                groupPlaying = false;
+                if (crouching.Value) crouching.Value = false;
+            }
+            if (!groupPlaying && now >= nextGroupSnippet)
+            {
+                nextGroupSnippet = now + Random.Range(0.5f, 3f);
+                TryPlayGroupSnippet(p, now);
+            }
+            if (groupPlaying)
+            {
+                hasLook = false;
+                freeLookOn = false;
+            }
+            else
+            {
+                if (now >= nextGroupLook)
                 {
-                    hasLook = false;
-                    freeLookOn = true;
-                    Vector3 to = p.transform.position - transform.position;
-                    freeLookYaw = Mathf.Atan2(to.x, to.z) * Mathf.Rad2Deg + Random.Range(-70f, 70f);
-                    freeLookPitch = Random.Range(-12f, 18f);
+                    nextGroupLook = now + Random.Range(1.5f, 4f);
+                    float roll = Random.value;
+                    if (roll < 0.4f) { hasLook = true; lookPoint = Head(p); freeLookOn = false; }
+                    else if (roll < 0.7f && GroupForward(p, out float gy, out float gpitch))
+                    {
+                        // grubun baktığı yere bak
+                        hasLook = false;
+                        freeLookOn = true;
+                        freeLookYaw = gy + Random.Range(-15f, 15f);
+                        freeLookPitch = Mathf.Clamp(gpitch, -20f, 25f);
+                    }
+                    else
+                    {
+                        hasLook = false;
+                        freeLookOn = true;
+                        Vector3 to = p.transform.position - transform.position;
+                        freeLookYaw = Mathf.Atan2(to.x, to.z) * Mathf.Rad2Deg + Random.Range(-70f, 70f);
+                        freeLookPitch = Random.Range(-12f, 18f);
+                    }
                 }
-            }
-            if (now >= nextGroupCrouch)
-            {
-                if (crouching.Value) { crouching.Value = false; nextGroupCrouch = now + Random.Range(6f, 14f); }
-                else if (Random.value < Mathf.Clamp(prof.crouchRatio + 0.15f, 0f, 0.6f))
-                { crouching.Value = true; nextGroupCrouch = now + Random.Range(1.5f, 4f); }
-                else nextGroupCrouch = now + Random.Range(6f, 14f);
-            }
-            if (now >= nextGroupToggle)
-            {
-                nextGroupToggle = now + Random.Range(8f, 20f);
-                flashlightOn.Value = WantsFlashlight(transform.position, prof);
+                if (now >= nextGroupCrouch)
+                {
+                    if (crouching.Value) { crouching.Value = false; nextGroupCrouch = now + Random.Range(6f, 14f); }
+                    else if (Random.value < Mathf.Clamp(prof.crouchRatio + 0.15f, 0f, 0.6f))
+                    { crouching.Value = true; nextGroupCrouch = now + Random.Range(1.5f, 4f); }
+                    else nextGroupCrouch = now + Random.Range(6f, 14f);
+                }
+                if (now >= nextGroupToggle)
+                {
+                    nextGroupToggle = now + Random.Range(8f, 20f);
+                    flashlightOn.Value = WantsFlashlight(transform.position, prof);
+                }
             }
             if (now >= nextFollowSpeak && now >= speakCooldownUntil)
             {
@@ -1178,6 +1823,21 @@ namespace MimicGame.Mimic
                 bool ok = TrySpeak(p, FollowRadius, false, ClipPref.Call, "grup", now);
                 speakCooldownUntil = now + (ok ? Random.Range(5f, 12f) : 2f);
             }
+        }
+
+        // Kimliğin "grupta bekleme" parçasını oynatır; yarı yarıya grubun baktığı yöne çevrilir
+        void TryPlayGroupSnippet(PlayerNetwork p, float now)
+        {
+            var s = BehaviorRecorder.Pick(targetClientId.Value, SnippetTag.GroupIdle, lastSnippet);
+            if (s == null) return;
+            float baseYaw = transform.eulerAngles.y;
+            float pitchOff = 0f;
+            if (Random.value < 0.5f && GroupForward(p, out float gy, out float gpitch))
+            {
+                baseYaw = gy - s.meanYaw;
+                pitchOff = Mathf.Clamp(gpitch - s.meanPitch, -20f, 20f);
+            }
+            if (BeginPlayback(s, now, baseYaw, pitchOff, false, false)) groupPlaying = true;
         }
 
         void EndGroup(float now, string why)
@@ -1223,6 +1883,7 @@ namespace MimicGame.Mimic
         void UpdateMovementFeel(float now, float dt)
         {
             if (atk != AttackState.None || !agent.isOnNavMesh) return;
+            if (playback.IsPlaying && playback.Moving) return; // yürüyüşü parça sürüyor
 
             if (now < pauseUntil)
             {
@@ -1294,6 +1955,7 @@ namespace MimicGame.Mimic
                 if (!FindLureSpot(victim, out var spotPos)) continue;
 
                 SetActivity(Activity.Lure, "kurban " + victim.OwnerClientId + ", kimlik " + id);
+                TryDarkenRoom(victim, now);
                 lureSpot = spotPos;
                 lureVictim = victim.OwnerClientId;
                 lureDeadline = now + 20f;
@@ -1499,6 +2161,8 @@ namespace MimicGame.Mimic
             if (activity == Activity.Group && nearest != null && nearest.OwnerClientId == groupTarget)
                 followTime += dt; // gruptaki toplam süre (başlangıç ve sınır StartGroup'ta)
 
+            UpdateTrust(now, dt);
+
             if (nearest == null || now < attackCooldownUntil || !agentReady)
             {
                 isoTimer = 0f;
@@ -1506,9 +2170,10 @@ namespace MimicGame.Mimic
                 return false;
             }
             ulong id = nearest.OwnerClientId;
+            nearestTrustId = id;
 
-            // 1) Yalnız kurbana yakın
-            if (nearestD <= AttackIsolatedRange && IsIsolated(nearest))
+            // 1) Yalnız kurbana yakın (ve kurban son 2 dk'da yeterince "güvenmiş" olmalı)
+            if (nearestD <= AttackIsolatedRange && IsIsolated(nearest) && TrustSeconds(id) >= TrustNeeded)
             {
                 if (isoVictim != id) { isoVictim = id; isoTimer = 0f; }
                 isoTimer += dt;
@@ -1540,8 +2205,41 @@ namespace MimicGame.Mimic
             return true;
         }
 
+        // Her oyuncunun yakınımızda geçirdiği süre: 10 sn'lik 12 kova (son 2 dk)
+        void UpdateTrust(float now, float dt)
+        {
+            long b = (long)(now / TrustBucketSec);
+            if (trustBucket < 0) trustBucket = b;
+            if (b != trustBucket)
+            {
+                long steps = System.Math.Min(b - trustBucket, TrustBuckets);
+                foreach (var kv in trust)
+                    for (long k = 1; k <= steps; k++) kv.Value[(int)((trustBucket + k) % TrustBuckets)] = 0f;
+                trustBucket = b;
+            }
+            int idx = (int)(b % TrustBuckets);
+            for (int i = 0; i < tmpPlayers.Count; i++)
+            {
+                var p = tmpPlayers[i];
+                if (p == null) continue;
+                if (FlatDist(transform.position, p.transform.position) > TrustRadius) continue;
+                if (!trust.TryGetValue(p.OwnerClientId, out var arr)) { arr = new float[TrustBuckets]; trust[p.OwnerClientId] = arr; }
+                arr[idx] += dt;
+            }
+        }
+
+        float TrustSeconds(ulong clientId)
+        {
+            if (!trust.TryGetValue(clientId, out var arr)) return 0f;
+            float sum = 0f;
+            for (int i = 0; i < arr.Length; i++) sum += arr[i];
+            return sum;
+        }
+
         void StartAttack(PlayerNetwork victim, string why, float now)
         {
+            StopPlayback();
+            pendingDoor = null;
             atk = AttackState.WindUp;
             atkVictim = victim.OwnerClientId;
             atkStart = now;
@@ -1554,7 +2252,7 @@ namespace MimicGame.Mimic
             nextPickAt = now;
             SetActivity(Activity.Explore, "saldırı"); // grup / bekleme / çağrı sona erer
             lookOverrideUntil = 0f;
-            attackCooldownUntil = now + Random.Range(25f, 45f); // deneme sayılır
+            attackCooldownUntil = now + Random.Range(120f, 240f); // deneme sayılır
 
             crouching.Value = false;
             flashlightOn.Value = false;
@@ -1658,6 +2356,8 @@ namespace MimicGame.Mimic
         {
             Debug.Log("[Taklitçi] Öldürdü: " + victim.OwnerClientId);
             if (victim.Health != null) victim.Health.ServerKill("taklitçi");
+            pendingDeadId = victim.OwnerClientId; // ölünün kılığına gir (görülmüyorsa hemen)
+            Debug.Log("[Taklitçi] Ölenin kılığına girecek: Oyuncu " + victim.OwnerClientId);
             atk = AttackState.PostKill;
             atkStart = now;
             agent.ResetPath();
@@ -1745,7 +2445,7 @@ namespace MimicGame.Mimic
         {
             atk = AttackState.None;
             revealed.Value = false;
-            attackCooldownUntil = now + Random.Range(25f, 45f);
+            attackCooldownUntil = now + Random.Range(120f, 240f);
             agent.acceleration = baseAcceleration;
             agent.stoppingDistance = baseStopping;
             agent.ResetPath();
@@ -1770,7 +2470,8 @@ namespace MimicGame.Mimic
             if (atk != AttackState.None)
                 return atk + " | kurban " + atkVictim + " (" + atkReason + ") | " + (now - atkStart).ToString("0.0") + " sn";
             string cd = now < attackCooldownUntil ? "bekleme " + (attackCooldownUntil - now).ToString("0") + " sn" : "hazır";
-            return "yok | " + cd + " | yalnız " + isoTimer.ToString("0.0") + "/" + AttackIsolatedTime.ToString("0.0")
+            string trustTxt = atk == AttackState.None && nearestTrustId != ulong.MaxValue ? TrustSeconds(nearestTrustId).ToString("0") : "-";
+            return "yok | " + cd + " | güven " + trustTxt + "/" + TrustNeeded.ToString("0") + " | yalnız " + isoTimer.ToString("0.0") + "/" + AttackIsolatedTime.ToString("0.0")
                 + " | arkadan " + behindTimer.ToString("0.0") + "/" + AttackBehindTime.ToString("0.0")
                 + " | takip " + followTime.ToString("0") + "/" + followLimit.ToString("0") + " sn";
         }
@@ -1799,6 +2500,8 @@ namespace MimicGame.Mimic
         {
             return ActivityDebug() + " | kimlik: Oyuncu " + targetClientId.Value + " (renk " + colorIndex.Value + ") | ajan: " + (agentReady ? "hazır" : "YOK")
                 + "\n    saldırı: " + AttackDebug()
+                + "\n    oynatma: " + playback.Label + " | sahte eşya: " + FakeItemLabel
+                + (darkenedRoom >= 0 ? " | söndürülen oda: " + darkenedRoom : "")
                 + "\n    son konuşma: " + lastReason
                 + "\n    konum: " + transform.position.ToString("F1") + (IsSeen() ? " | görülüyor" : " | görülmüyor");
         }
@@ -1827,12 +2530,29 @@ namespace MimicGame.Mimic
                 float flat = new Vector2(to.x, to.z).magnitude;
                 targetPitch = Mathf.Clamp(Mathf.Atan2(-to.y, Mathf.Max(0.01f, flat)) * Mathf.Rad2Deg, -45f, 45f);
             }
+            else if (playback.IsPlaying)
+            {
+                // Kaydedilmiş parça: gövde yönü ve eğim birebir
+                float yr = playback.Yaw * Mathf.Deg2Rad;
+                dir = new Vector3(Mathf.Sin(yr), 0f, Mathf.Cos(yr));
+                targetPitch = Mathf.Clamp(playback.Pitch, -45f, 45f);
+            }
+            else if (Time.time < glanceUntil)
+            {
+                // Geriye bakma alışkanlığı: kısa süre omuz üstünden bak
+                float yr = glanceYaw * Mathf.Deg2Rad;
+                dir = new Vector3(Mathf.Sin(yr), 0f, Mathf.Cos(yr));
+                targetPitch = 4f;
+            }
             else if (moving) dir = agent.velocity;                       // gövde yürüyüş yönüne döner
             else if (freeLookOn)
             {
-                float yr = freeLookYaw * Mathf.Deg2Rad;
+                // Bakış titremesi: kimliğin dururken görülen küçük titremesi kadar
+                float jit = Mathf.Clamp(CurProfile.lookJitter * 0.3f, 0f, 4f);
+                float tt = Time.time;
+                float yr = (freeLookYaw + (Mathf.PerlinNoise(tt * 0.9f, 3.1f) - 0.5f) * 2f * jit) * Mathf.Deg2Rad;
                 dir = new Vector3(Mathf.Sin(yr), 0f, Mathf.Cos(yr));
-                targetPitch = Mathf.Clamp(freeLookPitch, -45f, 45f);
+                targetPitch = Mathf.Clamp(freeLookPitch + (Mathf.PerlinNoise(tt * 0.7f, 9.4f) - 0.5f) * 2f * jit, -45f, 45f);
             }
             else dir = Vector3.zero;
 
@@ -1840,9 +2560,10 @@ namespace MimicGame.Mimic
             if (dir.sqrMagnitude > 0.04f)
             {
                 var want = Quaternion.LookRotation(dir.normalized, Vector3.up);
-                transform.rotation = Quaternion.RotateTowards(transform.rotation, want, TurnRate * Time.deltaTime);
+                float rate = playback.IsPlaying ? Mathf.Max(turnRate, 540f) : turnRate;
+                transform.rotation = Quaternion.RotateTowards(transform.rotation, want, rate * Time.deltaTime);
             }
-            serverPitch = Mathf.MoveTowards(serverPitch, targetPitch, 120f * Time.deltaTime);
+            serverPitch = Mathf.MoveTowards(serverPitch, targetPitch, (playback.IsPlaying ? 400f : 120f) * Time.deltaTime);
             if (Mathf.Abs(serverPitch - pitch.Value) > 0.5f) pitch.Value = serverPitch;
         }
     }

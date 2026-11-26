@@ -43,6 +43,7 @@ namespace MimicGame.EditorTools
         const string ModelsRoot = "Assets/ThirdParty/Models";
         const string PlayerPrefabPath = PrefabDir + "/Player.prefab";
         const string MimicPrefabPath = PrefabDir + "/Mimic.prefab";
+        const string InteriorDoorPrefabPath = PrefabDir + "/InteriorDoor.prefab";
         const string NetworkPrefabsListPath = "Assets/DefaultNetworkPrefabs.asset";
 
         static readonly Vector3 FacilityCenter = new Vector3(0f, 0f, 20f);
@@ -73,13 +74,14 @@ namespace MimicGame.EditorTools
             BuildLampPosts();
             BuildPostProcessing();
             var itemPrefabs = BuildItemPrefabs(out var lootTable);
-            BuildFacilityGenerator(lootTable);
+            var doorPrefab = BuildInteriorDoorPrefab();
+            BuildFacilityGenerator(lootTable, doorPrefab);
             BuildAtmosphere();
             var playerPrefab = BuildPlayerPrefab();
             var mimicPrefab = BuildMimicPrefab();
             BuildNavMesh();
             BuildMimicDirector(mimicPrefab);
-            BuildNetwork(playerPrefab, mimicPrefab, itemPrefabs);
+            BuildNetwork(playerPrefab, mimicPrefab, itemPrefabs, doorPrefab);
             BuildMenuCamera();
 
             EditorSceneManager.SaveScene(scene, ScenePath);
@@ -462,13 +464,55 @@ namespace MimicGame.EditorTools
 
         // ---------- Tesis iç mekân üreticisi (ağ nesnesi) ----------
 
-        static void BuildFacilityGenerator(LootTable table)
+        // Oda kapısı: ağ nesnesi (kök, sabit) + menteşe (Door, döner) + panel. NavMesh'i engellemez.
+        static GameObject BuildInteriorDoorPrefab()
+        {
+            var root = new GameObject("Dahili Kapı");
+            root.AddComponent<NetworkObject>();
+
+            var hinge = new GameObject("Menteşe");
+            hinge.transform.SetParent(root.transform, false);
+            hinge.transform.localPosition = new Vector3(-0.78f, 0f, 0f);
+            var door = hinge.AddComponent<Door>();
+            door.openAngle = -95f;
+            door.speed = 5f;
+            door.passPoint = root.transform;
+
+            var doorMat = Mat("Tesis Dahili Kapı", new Color(0.26f, 0.2f, 0.15f));
+            var handleMat = Mat("Tesis Kapı Kolu", new Color(0.55f, 0.55f, 0.52f));
+
+            var panel = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            panel.name = "Panel";
+            panel.transform.SetParent(hinge.transform, false);
+            panel.transform.localPosition = new Vector3(0.78f, 1.19f, 0f);
+            panel.transform.localScale = new Vector3(1.56f, 2.38f, 0.05f);
+            panel.GetComponent<Renderer>().sharedMaterial = doorMat;
+            IgnoreNavMesh(panel);
+
+            for (int side = -1; side <= 1; side += 2)
+            {
+                var handle = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                handle.name = "Kol";
+                Object.DestroyImmediate(handle.GetComponent<Collider>());
+                handle.transform.SetParent(hinge.transform, false);
+                handle.transform.localPosition = new Vector3(1.4f, 1.05f, 0.05f * side);
+                handle.transform.localScale = new Vector3(0.14f, 0.04f, 0.04f);
+                handle.GetComponent<Renderer>().sharedMaterial = handleMat;
+            }
+
+            var prefab = PrefabUtility.SaveAsPrefabAsset(root, InteriorDoorPrefabPath);
+            Object.DestroyImmediate(root);
+            return prefab;
+        }
+
+        static void BuildFacilityGenerator(LootTable table, GameObject interiorDoorPrefab)
         {
             var go = new GameObject("Tesis Üreteci");
             go.transform.position = new Vector3(0f, -100f, 0f); // haritanın çok altı
             go.AddComponent<NetworkObject>(); // sahnede yerleşik; kimlikleri RefreshNetworkObjectIds verir
             var gen = go.AddComponent<FacilityGenerator>();
             gen.lootTable = table;
+            gen.interiorDoorPrefab = interiorDoorPrefab;
             gen.outsideExitPoint = new Vector3(0f, 0.05f, 7.5f);
             gen.outsideExitYaw = 180f;
 
@@ -706,7 +750,7 @@ namespace MimicGame.EditorTools
 
         // ---------- Ağ ----------
 
-        static void BuildNetwork(GameObject playerPrefab, GameObject mimicPrefab, List<GameObject> itemPrefabs)
+        static void BuildNetwork(GameObject playerPrefab, GameObject mimicPrefab, List<GameObject> itemPrefabs, GameObject doorPrefab)
         {
             var go = new GameObject("NetworkManager");
             var nm = go.AddComponent<NetworkManager>();
@@ -730,6 +774,8 @@ namespace MimicGame.EditorTools
             foreach (var ip in itemPrefabs)
                 if (ip != null && !list.Contains(ip))
                     list.Add(new NetworkPrefab { Prefab = ip });
+            if (doorPrefab != null && !list.Contains(doorPrefab))
+                list.Add(new NetworkPrefab { Prefab = doorPrefab });
             EditorUtility.SetDirty(list);
             AssetDatabase.SaveAssets();
             if (!nm.NetworkConfig.Prefabs.NetworkPrefabsLists.Contains(list))
@@ -787,6 +833,7 @@ namespace MimicGame.EditorTools
             var voice = player.AddComponent<PlayerVoice>();
             player.AddComponent<ClipSharing>();
             var health = player.AddComponent<PlayerHealth>();
+            player.AddComponent<Footsteps>();
 
             // Kamera
             var camGo = new GameObject("Kamera");
@@ -891,6 +938,7 @@ namespace MimicGame.EditorTools
             col.center = new Vector3(0f, 0.9f, 0f);
 
             var ai = mimic.AddComponent<MimicAI>();
+            mimic.AddComponent<Footsteps>(); // oyuncuyla aynı ayak sesleri
 
             // Gövde: oyuncununkiyle aynı
             var body = GameObject.CreatePrimitive(PrimitiveType.Capsule);
@@ -906,6 +954,11 @@ namespace MimicGame.EditorTools
             var pivot = new GameObject("Kamera");
             pivot.transform.SetParent(mimic.transform, false);
             pivot.transform.localPosition = new Vector3(0f, 1.65f, 0f);
+
+            // El (sahte eşyanın görseli burada durur; oyuncununkiyle aynı yer)
+            var hand = new GameObject("El");
+            hand.transform.SetParent(pivot.transform, false);
+            hand.transform.localPosition = new Vector3(0.35f, -0.3f, 0.55f);
 
             var lightGo = new GameObject("El Feneri");
             lightGo.transform.SetParent(pivot.transform, false);
@@ -931,6 +984,7 @@ namespace MimicGame.EditorTools
             ai.body = body.transform;
             ai.bodyRenderer = bodyRenderer;
             ai.cameraPivot = pivot.transform;
+            ai.hand = hand.transform;
             ai.spot = spot;
             ai.voicePlayer = vp;
 

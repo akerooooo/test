@@ -45,12 +45,23 @@ namespace MimicGame.Mimic
             r.SetPropertyBlock(block);
         }
 
-        // 2 m'lik kapsül primitifini verilen boya (ve genişliğe) göre ölçekler
-        public static void ApplyBody(Transform body, float height, float width = 0.7f)
+        // Zıplama hareketi (küçük gövde sıçraması)
+        public const float HopDuration = 0.35f;
+        public const float HopHeight = 0.25f;
+
+        /// <summary>Sıçrama başlangıcından t sn sonra gövdenin yukarı kayması (m).</summary>
+        public static float HopOffset(float t)
+        {
+            if (t < 0f || t >= HopDuration) return 0f;
+            return Mathf.Sin(Mathf.PI * t / HopDuration) * HopHeight;
+        }
+
+        // 2 m'lik kapsül primitifini verilen boya (ve genişliğe) göre ölçekler; yOffset zıplama içindir
+        public static void ApplyBody(Transform body, float height, float width = 0.7f, float yOffset = 0f)
         {
             if (body == null) return;
             body.localScale = new Vector3(width, height * 0.5f, width);
-            body.localPosition = new Vector3(0f, height * 0.5f, 0f);
+            body.localPosition = new Vector3(0f, height * 0.5f + yOffset, 0f);
         }
     }
 }

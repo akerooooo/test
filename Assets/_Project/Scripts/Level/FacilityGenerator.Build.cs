@@ -322,9 +322,10 @@ namespace MimicGame.Level
         {
             Transform p = sp.root;
             Block(p, "Armatür", new Vector3(pos.x, pos.y - 0.045f, pos.z), new Vector3(1.3f, 0.07f, 0.28f), metalMat, false, yaw);
-            Block(p, "Tüp", new Vector3(pos.x, pos.y - 0.1f, pos.z), new Vector3(1.2f, 0.03f, 0.14f),
+            var tube = Block(p, "Tüp", new Vector3(pos.x, pos.y - 0.1f, pos.z), new Vector3(1.2f, 0.03f, 0.14f),
                 working ? stripOnMat : stripOffMat, false, yaw);
             if (!working) return;
+            RegisterTube(sp.id, tube.GetComponent<Renderer>());
             var go = new GameObject("Floresan Işık");
             go.transform.SetParent(p, false);
             go.transform.localPosition = new Vector3(pos.x, pos.y - (sp.h >= HallH - 0.01f ? 1.0f : 0.5f), pos.z);
@@ -339,6 +340,7 @@ namespace MimicGame.Level
                 var f = go.AddComponent<LightFlicker>(); // intensity ayarlandıktan sonra eklenir
                 f.flickerChance = 0.1f;
             }
+            RegisterLight(sp.id, l);
             if (culler != null) culler.Register(l);
         }
 

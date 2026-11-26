@@ -330,6 +330,12 @@ namespace MimicGame.Mimic
                   .Append(VoiceClipLibrary.CountReplies(id)).Append('/').Append(VoiceClipLibrary.Count(id))
                   .Append(ClipSharing.IsAllowed(id) ? "" : " (taklit kapalı)").AppendLine();
             }
+            sb.AppendLine("Davranış parçaları (oyuncu başına):");
+            for (int i = 0; i < list.Count; i++)
+            {
+                ulong id = list[i].ClientId;
+                sb.Append("  Oyuncu ").Append(id).Append(": ").AppendLine(BehaviorRecorder.DebugLine(id));
+            }
 
             GUI.color = new Color(0f, 0f, 0f, 0.7f);
             int lineCount = 1;
