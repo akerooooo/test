@@ -58,10 +58,10 @@ namespace MimicGame.UI
                     var r = new Rect(x0 + i * (size + gap), y, size, size);
                     GUI.color = new Color(0f, 0f, 0f, 0.35f);
                     GUI.DrawTexture(r, white);
-                    GUI.color = i == inventory.Selected ? new Color(1f, 1f, 1f, 0.9f) : new Color(1f, 1f, 1f, 0.3f);
+                    GUI.color = i == inventory.SelectedSlot ? new Color(1f, 1f, 1f, 0.9f) : new Color(1f, 1f, 1f, 0.3f);
                     Border(r, 2f * s, white);
                     GUI.color = Color.white;
-                    var item = inventory.Slots[i];
+                    var item = inventory.GetSlot(i);
                     if (item != null) GUI.Label(r, item.displayName + "\n" + item.value + "$", slotStyle);
                 }
                 if (inventory.TotalWeight > 0f)

@@ -1,17 +1,20 @@
-using System.Collections.Generic;
 using MimicGame.Items;
+using Unity.Netcode;
 using UnityEngine;
 
 namespace MimicGame.Player
 {
     /// <summary>
     /// 4 slotluk envanter. 1-4 veya fare tekerleği ile slot seçilir, G ile bırakılır.
+    /// Slotlar eşyaların (holderId, heldSlot) durumundan türetilir; sunucu belirler.
     /// Taşınan ağırlık oyuncuyu yavaşlatır.
     /// </summary>
     [RequireComponent(typeof(PlayerInputReader))]
-    public class PlayerInventory : MonoBehaviour
+    public class PlayerInventory : NetworkBehaviour
     {
         public const int SlotCount = 4;
+        const float MaxPickupDistance = 4f;
+        const float MaxDropDistance = 5f;
 
         public Transform viewPoint;
         public Transform hand;
@@ -19,12 +22,13 @@ namespace MimicGame.Player
         public float slowdownPerKg = 0.008f;
         public float minSpeedMultiplier = 0.5f;
 
-        public int Selected { get; private set; }
-        public Item Current => slots[Selected];
-        public IReadOnlyList<Item> Slots => slots;
+        public int SelectedSlot => selectedSlot.Value;
+        public Item Current => GetSlot(SelectedSlot);
         public float TotalWeight { get; private set; }
 
-        readonly Item[] slots = new Item[SlotCount];
+        readonly NetworkVariable<int> selectedSlot = new NetworkVariable<int>(0,
+            NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Owner);
+
         PlayerInputReader input;
         PlayerMotor motor;
 
@@ -34,37 +38,54 @@ namespace MimicGame.Player
             motor = GetComponent<PlayerMotor>();
         }
 
+        /// <summary>Bu oyuncunun verilen slottaki eşyası (yoksa null).</summary>
+        public Item GetSlot(int index)
+        {
+            if (!IsSpawned) return null;
+            ulong id = NetworkObject.NetworkObjectId;
+            var all = Item.All;
+            for (int i = 0; i < all.Count; i++)
+            {
+                var it = all[i];
+                if (it != null && it.HolderId == id && it.HeldSlot == index) return it;
+            }
+            return null;
+        }
+
         void Update()
         {
+            if (!IsSpawned || !IsOwner) return;
+
             int key = input.SlotPressed;
-            if (key >= 0) Select(key);
+            if (key >= 0) selectedSlot.Value = key;
 
             float scroll = input.Scroll;
             if (Mathf.Abs(scroll) > 0.01f)
-                Select((Selected + (scroll > 0f ? -1 : 1) + SlotCount) % SlotCount);
+                selectedSlot.Value = (SelectedSlot + (scroll > 0f ? -1 : 1) + SlotCount) % SlotCount;
 
             if (input.DropPressed) DropCurrent();
-        }
 
-        public bool TryPickup(Item item)
-        {
-            if (item == null || item.IsHeld) return false;
-
-            int index = slots[Selected] == null ? Selected : System.Array.IndexOf(slots, null);
-            if (index < 0) return false; // envanter dolu
-
-            slots[index] = item;
-            item.OnPickedUp(hand);
-            Select(index);
             RecalculateWeight();
-            return true;
         }
 
-        public void DropCurrent()
+        /// <summary>Sahip tarafı: eşyayı almak için sunucudan izin ister.</summary>
+        public void RequestPickup(Item item)
+        {
+            if (!IsOwner || item == null || item.IsHeld || !item.IsSpawned) return;
+
+            int slot = GetSlot(SelectedSlot) == null ? SelectedSlot : -1;
+            for (int i = 0; slot < 0 && i < SlotCount; i++)
+                if (GetSlot(i) == null) slot = i;
+            if (slot < 0) return; // envanter dolu
+
+            selectedSlot.Value = slot;
+            PickupRpc(new NetworkObjectReference(item.NetworkObject), slot);
+        }
+
+        void DropCurrent()
         {
             var item = Current;
             if (item == null) return;
-            slots[Selected] = null;
 
             // Yatay ileri yön (kamera eğimi yok sayılır)
             Vector3 fwd = Vector3.ProjectOnPlane(viewPoint.forward, Vector3.up);
@@ -77,26 +98,54 @@ namespace MimicGame.Player
                     QueryTriggerInteraction.Ignore))
                 distance = Mathf.Max(0f, wall.distance - 0.25f);
 
-            // Yaw rotasyonu; zemine oturtma Item içinde
             Quaternion rot = Quaternion.Euler(0f, Quaternion.LookRotation(fwd, Vector3.up).eulerAngles.y, 0f);
-            item.PlaceOnGround(transform.position + fwd * distance + Vector3.up * 0.3f, rot);
-            RecalculateWeight();
-        }
-
-        void Select(int index)
-        {
-            Selected = index;
-            for (int i = 0; i < SlotCount; i++)
-                if (slots[i] != null) slots[i].SetVisible(i == Selected);
+            item.ComputeGroundPose(transform.position + fwd * distance + Vector3.up * 0.3f, rot, out var pos);
+            DropRpc(new NetworkObjectReference(item.NetworkObject), pos, rot);
         }
 
         void RecalculateWeight()
         {
             float w = 0f;
-            foreach (var s in slots) if (s != null) w += s.weight;
+            for (int i = 0; i < SlotCount; i++)
+            {
+                var it = GetSlot(i);
+                if (it != null) w += it.weight;
+            }
             TotalWeight = w;
             if (motor != null)
                 motor.CarryWeightMultiplier = Mathf.Clamp(1f - w * slowdownPerKg, minSpeedMultiplier, 1f);
+        }
+
+        // ---------- Sunucu ----------
+
+        [Rpc(SendTo.Server)]
+        void PickupRpc(NetworkObjectReference itemRef, int slot, RpcParams rpcParams = default)
+        {
+            if (rpcParams.Receive.SenderClientId != OwnerClientId) return;
+            if (slot < 0 || slot >= SlotCount) return;
+            if (!itemRef.TryGet(out var no) || no == null) return;
+            var item = no.GetComponent<Item>();
+            if (item == null || item.IsHeld) return;
+            if (GetSlot(slot) != null) return;
+            if (Vector3.Distance(transform.position, item.RestPosition) > MaxPickupDistance) return;
+
+            item.ServerSetHeld(NetworkObject.NetworkObjectId, slot);
+        }
+
+        [Rpc(SendTo.Server)]
+        void DropRpc(NetworkObjectReference itemRef, Vector3 pos, Quaternion rot, RpcParams rpcParams = default)
+        {
+            if (rpcParams.Receive.SenderClientId != OwnerClientId) return;
+            if (!itemRef.TryGet(out var no) || no == null) return;
+            var item = no.GetComponent<Item>();
+            if (item == null || item.HolderId != NetworkObject.NetworkObjectId) return;
+
+            // Uzak/geçersiz konumu oyuncunun ayağına çek
+            if (float.IsNaN(pos.x + pos.y + pos.z) ||
+                Vector3.Distance(transform.position, pos) > MaxDropDistance)
+                item.ComputeGroundPose(transform.position + Vector3.up * 0.3f, rot, out pos);
+
+            item.ServerDrop(pos, rot);
         }
     }
 }

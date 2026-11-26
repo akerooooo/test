@@ -2,8 +2,12 @@ using System.IO;
 using MimicGame.Environment;
 using MimicGame.Game;
 using MimicGame.Items;
+using MimicGame.Network;
 using MimicGame.Player;
 using MimicGame.UI;
+using Unity.Netcode;
+using Unity.Netcode.Components;
+using Unity.Netcode.Transports.UTP;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
@@ -22,6 +26,9 @@ namespace MimicGame.EditorTools
         const string SceneDir = "Assets/_Project/Scenes";
         const string ScenePath = SceneDir + "/TestScene.unity";
         const string MaterialDir = "Assets/_Project/Materials";
+        const string PrefabDir = "Assets/_Project/Prefabs";
+        const string PlayerPrefabPath = PrefabDir + "/Player.prefab";
+        const string NetworkPrefabsListPath = "Assets/DefaultNetworkPrefabs.asset";
 
         [MenuItem("MimicGame/Test Sahnesini Oluştur")]
         public static void Build()
@@ -34,6 +41,7 @@ namespace MimicGame.EditorTools
 
             Directory.CreateDirectory(SceneDir);
             Directory.CreateDirectory(MaterialDir);
+            Directory.CreateDirectory(PrefabDir);
             AssetDatabase.Refresh();
 
             var scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
@@ -42,7 +50,9 @@ namespace MimicGame.EditorTools
             BuildGround();
             BuildVan(new Vector3(0f, 0f, -8f));
             BuildFacility(new Vector3(0f, 0f, 20f));
-            BuildPlayer(new Vector3(0f, 0.05f, -3f));
+            var playerPrefab = BuildPlayerPrefab();
+            BuildNetwork(playerPrefab);
+            BuildMenuCamera();
 
             EditorSceneManager.SaveScene(scene, ScenePath);
             AddToBuildSettings(ScenePath);
@@ -148,6 +158,8 @@ namespace MimicGame.EditorTools
             var hinge = new GameObject("Giriş Kapısı");
             hinge.transform.SetParent(t, false);
             hinge.transform.localPosition = new Vector3(-1f, 0f, -half);
+            // Sahnede yerleşik NetworkObject (üstünde başka NetworkObject yok)
+            hinge.AddComponent<NetworkObject>();
             hinge.AddComponent<Door>();
             var panel = Box("Kapı Paneli", hinge.transform, new Vector3(1f, 1.25f, 0f), new Vector3(1.95f, 2.5f, 0.08f),
                 Mat("Kapı", new Color(0.25f, 0.15f, 0.1f)));
@@ -200,10 +212,9 @@ namespace MimicGame.EditorTools
             Object.DestroyImmediate(go.GetComponent<Collider>());
             go.AddComponent<BoxCollider>();
 
-            var rb = go.AddComponent<Rigidbody>();
-            rb.mass = Mathf.Max(0.5f, weight);
-            rb.isKinematic = true;
-            rb.useGravity = false;
+            // Eşya durumunu sunucu tutar; reparent yok
+            var no = go.AddComponent<NetworkObject>();
+            no.AutoObjectParentSync = false;
 
             var item = go.AddComponent<Item>();
             item.displayName = name;
@@ -211,12 +222,53 @@ namespace MimicGame.EditorTools
             item.weight = weight;
         }
 
+        // ---------- Ağ ----------
+
+        static void BuildNetwork(GameObject playerPrefab)
+        {
+            var go = new GameObject("NetworkManager");
+            var nm = go.AddComponent<NetworkManager>();
+            var utp = go.AddComponent<UnityTransport>();
+            if (nm.NetworkConfig == null) nm.NetworkConfig = new NetworkConfig();
+            nm.NetworkConfig.NetworkTransport = utp;
+            nm.NetworkConfig.PlayerPrefab = playerPrefab;
+
+            // Oyuncu prefabı bir NetworkPrefabsList içinde olmalı
+            var list = AssetDatabase.LoadAssetAtPath<NetworkPrefabsList>(NetworkPrefabsListPath);
+            if (list == null)
+            {
+                list = ScriptableObject.CreateInstance<NetworkPrefabsList>();
+                AssetDatabase.CreateAsset(list, NetworkPrefabsListPath);
+            }
+            if (!list.Contains(playerPrefab))
+                list.Add(new NetworkPrefab { Prefab = playerPrefab });
+            EditorUtility.SetDirty(list);
+            AssetDatabase.SaveAssets();
+            if (!nm.NetworkConfig.Prefabs.NetworkPrefabsLists.Contains(list))
+                nm.NetworkConfig.Prefabs.NetworkPrefabsLists.Add(list);
+
+            var menu = new GameObject("Menü");
+            menu.AddComponent<NetworkMenu>();
+        }
+
+        static void BuildMenuCamera()
+        {
+            var go = new GameObject("Menü Kamerası");
+            go.transform.position = new Vector3(8f, 6f, -14f);
+            go.transform.LookAt(new Vector3(0f, 1f, 10f));
+            var cam = go.AddComponent<Camera>();
+            cam.clearFlags = CameraClearFlags.SolidColor;
+            cam.backgroundColor = Color.black;
+            go.AddComponent<AudioListener>();
+            go.AddComponent<MenuCamera>();
+        }
+
         // ---------- Oyuncu ----------
 
-        static void BuildPlayer(Vector3 pos)
+        static GameObject BuildPlayerPrefab()
         {
             var player = new GameObject("Oyuncu");
-            player.transform.position = pos;
+            player.transform.position = Vector3.zero;
 
             var cc = player.AddComponent<CharacterController>();
             cc.height = 1.8f;
@@ -225,6 +277,16 @@ namespace MimicGame.EditorTools
             cc.stepOffset = 0.35f;
             cc.slopeLimit = 50f;
 
+            player.AddComponent<NetworkObject>();
+            var nt = player.AddComponent<NetworkTransform>();
+            nt.AuthorityMode = NetworkTransform.AuthorityModes.Owner;
+            nt.SyncRotAngleX = false;
+            nt.SyncRotAngleZ = false;
+            nt.SyncScaleX = false;
+            nt.SyncScaleY = false;
+            nt.SyncScaleZ = false;
+            nt.Interpolate = true;
+
             player.AddComponent<PlayerInputReader>();
             player.AddComponent<PlayerMotor>();
             var look = player.AddComponent<PlayerLook>();
@@ -232,6 +294,7 @@ namespace MimicGame.EditorTools
             var interactor = player.AddComponent<PlayerInteractor>();
             var flashlight = player.AddComponent<Flashlight>();
             player.AddComponent<PlayerHUD>();
+            var net = player.AddComponent<PlayerNetwork>();
 
             // Kamera
             var camGo = new GameObject("Kamera");
@@ -242,7 +305,7 @@ namespace MimicGame.EditorTools
             cam.fieldOfView = 70f;
             cam.clearFlags = CameraClearFlags.SolidColor;
             cam.backgroundColor = Color.black;
-            camGo.AddComponent<AudioListener>();
+            var listener = camGo.AddComponent<AudioListener>();
             camGo.tag = "MainCamera";
 
             // El feneri
@@ -263,11 +326,30 @@ namespace MimicGame.EditorTools
             hand.transform.SetParent(camGo.transform, false);
             hand.transform.localPosition = new Vector3(0.35f, -0.3f, 0.55f);
 
+            // Gövde (diğer oyuncuların gördüğü kapsül, collider yok)
+            var body = GameObject.CreatePrimitive(PrimitiveType.Capsule);
+            body.name = "Gövde";
+            body.transform.SetParent(player.transform, false);
+            body.transform.localPosition = new Vector3(0f, 0.9f, 0f);
+            body.transform.localScale = new Vector3(0.7f, 0.9f, 0.7f);
+            Object.DestroyImmediate(body.GetComponent<Collider>());
+            var bodyRenderer = body.GetComponent<Renderer>();
+            bodyRenderer.sharedMaterial = Mat("Oyuncu Gövde", new Color(0.25f, 0.4f, 0.6f));
+
             look.cameraPivot = camGo.transform;
             inventory.viewPoint = camGo.transform;
             inventory.hand = hand.transform;
             interactor.viewPoint = camGo.transform;
             flashlight.spot = spot;
+            net.cameraPivot = camGo.transform;
+            net.body = body.transform;
+            net.bodyRenderer = bodyRenderer;
+            net.cam = cam;
+            net.listener = listener;
+
+            var prefab = PrefabUtility.SaveAsPrefabAsset(player, PlayerPrefabPath);
+            Object.DestroyImmediate(player);
+            return prefab;
         }
 
         // ---------- Yardımcılar ----------

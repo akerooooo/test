@@ -1,3 +1,4 @@
+using MimicGame.Network;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
@@ -26,16 +27,16 @@ namespace MimicGame.Player
             motor = GetComponent<PlayerMotor>();
         }
 
-        void Start() => LockCursor(true);
-
         void Update()
         {
             var kb = Keyboard.current;
             var mouse = Mouse.current;
-            if (kb != null && kb.escapeKey.wasPressedThisFrame) LockCursor(false);
+            if (kb != null && kb.escapeKey.wasPressedThisFrame) SetCursorLocked(false);
             if (Cursor.lockState != CursorLockMode.Locked)
             {
-                if (mouse != null && mouse.leftButton.wasPressedThisFrame) LockCursor(true);
+                if (mouse != null && mouse.leftButton.wasPressedThisFrame &&
+                    !NetworkMenu.PointerOverButton(mouse.position.ReadValue()))
+                    SetCursorLocked(true);
                 return;
             }
 
@@ -51,7 +52,8 @@ namespace MimicGame.Player
                 cameraPivot.localPosition = new Vector3(0f, motor.CurrentHeight - eyeOffsetFromTop, 0f);
         }
 
-        static void LockCursor(bool locked)
+        /// <summary>İmleç kilidi; ilk kilit oyuncu doğunca PlayerNetwork tarafından verilir.</summary>
+        public static void SetCursorLocked(bool locked)
         {
             Cursor.lockState = locked ? CursorLockMode.Locked : CursorLockMode.None;
             Cursor.visible = !locked;
