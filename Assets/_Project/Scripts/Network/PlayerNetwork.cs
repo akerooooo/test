@@ -3,6 +3,7 @@ using MimicGame.Items;
 using MimicGame.Mimic;
 using MimicGame.Player;
 using MimicGame.UI;
+using MimicGame.Voice;
 using Unity.Netcode;
 using Unity.Netcode.Components;
 using UnityEngine;
@@ -83,6 +84,8 @@ namespace MimicGame.Network
             }
 
             Local = this;
+            // Oda yankısı: yalnızca yerel dinleyicide (kamera üstünde)
+            RoomAcoustics.Attach(listener != null ? listener.gameObject : (cam != null ? cam.gameObject : null));
             if (bodyRenderer != null) bodyRenderer.shadowCastingMode = ShadowCastingMode.ShadowsOnly;
 
             // Spawn noktasına ışınla
@@ -118,6 +121,7 @@ namespace MimicGame.Network
 
             if (Local == this)
             {
+                RoomAcoustics.Detach(listener != null ? listener.gameObject : (cam != null ? cam.gameObject : null));
                 Local = null;
                 MenuCamera.SetActive(true);
                 PlayerLook.SetCursorLocked(false);

@@ -6,7 +6,8 @@ namespace MimicGame.Voice
 {
     /// <summary>
     /// Tüm uzak ses çalmanın tek noktası. PCM float örnekleri alır, 3B olarak çalar.
-    /// Örneklerin ağdan mı kayıttan mı geldiğini bilmez (ileride taklitçiler aynı yolu kullanır).
+    /// Örneklerin ağdan mı kayıttan mı geldiğini bilmez (taklitçiler aynı yolu kullanır).
+    /// Uyarlanabilir jitter tamponu, hız ayarıyla kayma düzeltme ve Hermite yeniden örnekleme içerir.
     /// </summary>
     [RequireComponent(typeof(AudioSource))]
     public class VoicePlayer : MonoBehaviour
@@ -16,9 +17,9 @@ namespace MimicGame.Voice
         [HideInInspector] public int sampleRate = 48000;
         [Range(0f, 1f)] public float volume = 1f;
 
-        [Header("Mesafe")]
-        public float minDistance = 1.5f;
-        public float maxDistance = 25f;
+        // Sahnede eski değer kalmasın diye serileştirilmez
+        [System.NonSerialized] public float minDistance = 1.5f;
+        [System.NonSerialized] public float maxDistance = 40f;
 
         [Header("Duvar boğuklaştırma")]
         public float occludedCutoff = 1200f;
@@ -26,30 +27,52 @@ namespace MimicGame.Voice
         public float occludedVolume = 0.6f;
         public LayerMask occlusionMask = ~0;
 
-        const float PrebufferSeconds = 0.15f; // ağ dalgalanmasına karşı tampon
-        const float MaxBufferSeconds = 0.6f;
+        // Mesafe / hava emilimi
+        const float AirNearDistance = 8f;
+        const float AirFarCutoff = 5000f;
+        const float FadeTailFraction = 0.3f; // maxDistance'ın son %30'u yumuşakça sıfıra iner
+
+        // Jitter tamponu
+        const float TargetStart = 0.12f;
+        const float TargetStep = 0.03f;
+        const float TargetMax = 0.35f;
+        const float TargetMin = 0.08f;
+        const float TargetDecay = 0.01f;
+        const float DecayInterval = 5f;
+        const float DriftMax = 0.05f;
+        const float SkipSeconds = 1.0f;      // bundan fazla birikirse ileri atla
+        const float SkipFade = 0.010f;       // atlama çapraz geçişi
+        const float EdgeFade = 0.005f;       // yumuşak giriş/çıkış
+        const float GapReprebuffer = 0.25f;  // bundan uzun boşluktan sonra yeniden ön-tamponla
+        const float RingSeconds = 3f;
+
         const float CheckInterval = 0.1f;
-        const float StreamAheadSeconds = 0.3f; // klip akışında tamponda tutulacak miktar
         const float ArrayChunkSeconds = 0.1f;
+
+        enum PlayState { Prebuffer, Playing, Gap }
 
         AudioSource source;
         AudioLowPassFilter lowPass;
         AudioClip clip;
 
-        // Halka tampon (ses ve ana iş parçacığı arasında; hepsi lock altında)
+        // Halka tampon: GİRİŞ hızında örnekler (hepsi lock altında)
         readonly object sync = new object();
         float[] ring;
+        int ringRate;
         int head, count;
-        bool draining, flush;
-        int prebufferSamples, maxBufferSamples;
-
-        // Yeniden örnekleme durumu (lock altında)
-        int lastInRate;
-        double resPos;
-        float resPrev;
-        float[] scratch = new float[2048];
+        PlayState state = PlayState.Prebuffer;
+        bool flush;
+        bool driftEnabled = true;
+        double frac;           // p0 ile p1 arası kesirli konum
+        float hist;            // p[-1]
+        float lastOut, fade;
+        int gapSamples;
+        double smoothRatio = 1.0;
+        int underruns;
+        float targetSeconds = TargetStart;
 
         volatile float level;
+        float calmTimer;
 
         // Klip akışı (yalnızca ana iş parçacığı)
         VoiceClip streamClip;
@@ -58,24 +81,25 @@ namespace MimicGame.Voice
         int streamRate, streamPos;
         float[] streamDecode = new float[4096];
         bool streaming;
+        bool streamDecodedAny;
 
-        // Tıkanma
+        // Tıkanma / mesafe
         static AudioListener cachedListener;
         readonly RaycastHit[] hits = new RaycastHit[16];
         float nextCheck;
         float targetCutoff, targetMul = 1f;
         float curCutoff, curMul = 1f;
 
-        /// <summary>Tamponda çalınacak ses var mı (ileride taklitçi mantığı için).</summary>
+        /// <summary>Tamponda çalınacak ses var mı (taklitçi mantığı için).</summary>
         public bool IsPlaying
         {
             get
             {
                 if (streaming) return true;
-                lock (sync) return count > 0 || draining;
+                lock (sync) return state == PlayState.Playing || count >= 3 || (flush && count > 0);
             }
         }
-        /// <summary>Son okunan bloğun RMS değeri (ileride taklitçi mantığı için).</summary>
+        /// <summary>Son okunan bloğun RMS değeri.</summary>
         public float CurrentLevel => level;
 
         void Awake()
@@ -90,17 +114,11 @@ namespace MimicGame.Voice
             source.dopplerLevel = 0f;
             source.loop = true;
             source.playOnAwake = false;
+            source.reverbZoneMix = 1f; // oda yankısı alsın
             source.minDistance = minDistance;
             source.maxDistance = maxDistance;
             source.rolloffMode = AudioRolloffMode.Custom;
-            float k = Mathf.Clamp(minDistance / maxDistance, 0.01f, 0.9f);
-            source.SetCustomCurve(AudioSourceCurveType.CustomRolloff, new AnimationCurve(
-                new Keyframe(0f, 1f), new Keyframe(k, 1f), new Keyframe(0.2f, 0.3f),
-                new Keyframe(0.5f, 0.08f), new Keyframe(1f, 0f)));
-
-            prebufferSamples = Mathf.Max(1, Mathf.RoundToInt(sampleRate * PrebufferSeconds));
-            maxBufferSamples = Mathf.Max(prebufferSamples * 2, Mathf.RoundToInt(sampleRate * MaxBufferSeconds));
-            ring = new float[sampleRate * 2];
+            source.SetCustomCurve(AudioSourceCurveType.CustomRolloff, BuildRolloff(minDistance, maxDistance));
 
             curCutoff = targetCutoff = openCutoff;
             lowPass.cutoffFrequency = curCutoff;
@@ -117,7 +135,7 @@ namespace MimicGame.Voice
         void OnDisable()
         {
             if (source != null) source.Stop();
-            lock (sync) { head = 0; count = 0; draining = false; flush = false; }
+            lock (sync) ResetPlayback();
             StopStream();
         }
 
@@ -126,7 +144,51 @@ namespace MimicGame.Voice
             if (clip != null) Destroy(clip);
         }
 
-        /// <summary>Örnekleri (mono, -1..1) ekler. Gerekirse sampleRate'e çevirir. İş parçacığı güvenli.</summary>
+        // lock altında
+        void ResetPlayback()
+        {
+            head = 0; count = 0;
+            state = PlayState.Prebuffer;
+            flush = false;
+            frac = 0.0; hist = 0f; lastOut = 0f; fade = 0f;
+            gapSamples = 0;
+            smoothRatio = 1.0;
+        }
+
+        // ---------- Mesafe eğrisi ----------
+
+        // 1.5 m'ye kadar tam ses, sonra 1.5/d, son %30'da smoothstep ile 0
+        static float Gain(float d, float minD, float maxD)
+        {
+            float g = d <= minD ? 1f : minD / d;
+            float tailStart = maxD * (1f - FadeTailFraction);
+            if (d > tailStart)
+            {
+                float t = Mathf.Clamp01((d - tailStart) / (maxD - tailStart));
+                g *= 1f - t * t * (3f - 2f * t);
+            }
+            return d >= maxD ? 0f : g;
+        }
+
+        static AnimationCurve BuildRolloff(float minD, float maxD)
+        {
+            float[] ds = { 0f, minD, 2.2f, 3f, 4f, 6f, 8f, 11f, 14f, 18f, 22f, 25f, maxD * 0.7f, maxD * 0.775f, maxD * 0.85f, maxD * 0.925f, maxD };
+            const float eps = 0.002f;
+            var keys = new Keyframe[ds.Length];
+            for (int i = 0; i < ds.Length; i++)
+            {
+                float d = ds[i];
+                float v = Gain(d, minD, maxD);
+                float inT = i == 0 ? 0f : (v - Gain(d - eps, minD, maxD)) / eps * maxD;
+                float outT = i == ds.Length - 1 ? 0f : (Gain(d + eps, minD, maxD) - v) / eps * maxD;
+                keys[i] = new Keyframe(d / maxD, v, inT, outT);
+            }
+            return new AnimationCurve(keys);
+        }
+
+        // ---------- Giriş ----------
+
+        /// <summary>Örnekleri (mono, -1..1) ekler. Hemen kopyalanır; çağıran dizi sonra serbestçe yeniden kullanılabilir. İş parçacığı güvenli.</summary>
         public void PushSamples(float[] samples, int inputCount, int inputSampleRate)
         {
             if (samples == null || inputCount <= 0 || inputSampleRate <= 0) return;
@@ -134,31 +196,14 @@ namespace MimicGame.Voice
 
             lock (sync)
             {
-                if (inputSampleRate == sampleRate)
+                if (inputSampleRate != ringRate || ring == null)
                 {
-                    Enqueue(samples, inputCount);
-                    return;
+                    // Hız değişti: tamponu ve yeniden örnekleyiciyi sıfırla
+                    ringRate = inputSampleRate;
+                    ring = new float[Mathf.Max(1024, Mathf.RoundToInt(inputSampleRate * RingSeconds))];
+                    ResetPlayback();
                 }
-
-                // Doğrusal yeniden örnekleme (parçalar arası süreklilikle)
-                if (inputSampleRate != lastInRate) { lastInRate = inputSampleRate; resPos = 0; resPrev = samples[0]; }
-                double step = (double)inputSampleRate / sampleRate;
-                int maxOut = (int)(inputCount / step) + 2;
-                if (scratch.Length < maxOut) scratch = new float[maxOut];
-
-                int n = 0;
-                double p = resPos;
-                while (p < inputCount - 1 && n < scratch.Length)
-                {
-                    int i = (int)System.Math.Floor(p);
-                    float a = i < 0 ? resPrev : samples[i];
-                    float b = samples[i + 1];
-                    scratch[n++] = a + (b - a) * (float)(p - i);
-                    p += step;
-                }
-                resPos = p - inputCount;
-                resPrev = samples[inputCount - 1];
-                Enqueue(scratch, n);
+                Enqueue(samples, inputCount);
             }
         }
 
@@ -171,8 +216,7 @@ namespace MimicGame.Voice
             streamSamples = samples;
             streamRate = inputSampleRate;
             streamPos = 0;
-            streaming = true;
-            FeedStream();
+            BeginStream();
             return true;
         }
 
@@ -184,14 +228,22 @@ namespace MimicGame.Voice
             StopStream();
             streamClip = clip;
             streamPacket = 0;
-            streaming = true;
-            FeedStream();
+            BeginStream();
             return true;
+        }
+
+        void BeginStream()
+        {
+            streaming = true;
+            streamDecodedAny = false;
+            lock (sync) driftEnabled = false; // klipte hız oynatma yok
+            FeedStream();
         }
 
         // Klip bitti: ön-tamponlamayı beklemeden kalan kuyruğu da çal
         void EndStream()
         {
+            if (!streamDecodedAny) Debug.LogWarning("[Ses] Klip çözülemedi (codec desteklenmiyor olabilir).");
             lock (sync) flush = count > 0;
             StopStream();
         }
@@ -203,19 +255,25 @@ namespace MimicGame.Voice
             streamSamples = null;
             streamPacket = 0;
             streamPos = 0;
+            lock (sync) driftEnabled = true;
         }
 
-        int Buffered()
+        float BufferedSeconds()
         {
-            lock (sync) return count;
+            lock (sync) return ringRate > 0 ? (float)count / ringRate : 0f;
         }
 
-        // Tamponu ~0.3 sn ileride tutacak kadar çöz ve ekle
+        float TargetSeconds()
+        {
+            lock (sync) return targetSeconds;
+        }
+
+        // Tamponu hedef + 0.2 sn ileride tutacak kadar çöz ve ekle
         void FeedStream()
         {
             if (!streaming) return;
-            int target = Mathf.RoundToInt(sampleRate * StreamAheadSeconds);
-            for (int guard = 0; guard < 64 && Buffered() < target; guard++)
+            float ahead = TargetSeconds() + 0.2f;
+            for (int guard = 0; guard < 64 && BufferedSeconds() < ahead; guard++)
             {
                 if (streamClip != null)
                 {
@@ -224,6 +282,7 @@ namespace MimicGame.Voice
                     var (codec, data) = pk[streamPacket++];
                     if (data == null) continue;
                     if (!VoiceCodec.Decode(codec, data, data.Length, ref streamDecode, out int n, out int rate)) continue;
+                    streamDecodedAny = true;
                     PushSamples(streamDecode, n, rate);
                 }
                 else if (streamSamples != null)
@@ -234,107 +293,240 @@ namespace MimicGame.Voice
                     if (streamDecode.Length < len) streamDecode = new float[len];
                     System.Array.Copy(streamSamples, streamPos, streamDecode, 0, len);
                     streamPos += len;
+                    streamDecodedAny = true;
                     PushSamples(streamDecode, len, streamRate);
                 }
                 else { StopStream(); return; }
             }
         }
 
-        // lock altında çağrılır
+        // ---------- Tampon (lock altında) ----------
+
         void Enqueue(float[] src, int n)
         {
-            if (n > ring.Length) { src = SliceTail(src, n, ring.Length); n = ring.Length; }
-            // Gecikme sınırı: fazlalığı en eskiden at
-            int overflow = count + n - maxBufferSamples;
-            if (overflow > 0)
-            {
-                int drop = Mathf.Min(overflow, count);
-                head = (head + drop) % ring.Length;
-                count -= drop;
-            }
-            if (count + n > ring.Length) // yeni parça tek başına sınırı aşıyorsa
-            {
-                int drop = count + n - ring.Length;
-                head = (head + drop) % ring.Length;
-                count -= drop;
-            }
-            int tail = (head + count) % ring.Length;
-            int first = Mathf.Min(n, ring.Length - tail);
+            int total = count + n;
+            if (total > ring.Length) Grow(total);
+            int len = ring.Length;
+            int tail = (head + count) % len;
+            int first = Mathf.Min(n, len - tail);
             System.Array.Copy(src, 0, ring, tail, first);
             if (first < n) System.Array.Copy(src, first, ring, 0, n - first);
             count += n;
+            SkipAhead();
         }
 
-        static float[] SliceTail(float[] src, int n, int keep)
+        void Grow(int need)
         {
-            var r = new float[keep];
-            System.Array.Copy(src, n - keep, r, 0, keep);
-            return r;
+            int newLen = Mathf.Max(need, ring.Length * 2);
+            var nr = new float[newLen];
+            int first = Mathf.Min(count, ring.Length - head);
+            System.Array.Copy(ring, head, nr, 0, first);
+            if (first < count) System.Array.Copy(ring, 0, nr, first, count - first);
+            ring = nr;
+            head = 0;
         }
 
-        // Ses iş parçacığı: Unity API'si çağırma
+        // Son çare: 1 sn'den fazla birikmişse hedefe kadar ileri atla (10 ms çapraz geçişle)
+        void SkipAhead()
+        {
+            int limit = (int)(ringRate * SkipSeconds);
+            if (count <= limit) return;
+            int tgt = Mathf.Max(3, (int)(ringRate * targetSeconds));
+            int drop = count - tgt;
+            int len = ring.Length;
+            int k = Mathf.Min(Mathf.Max(1, (int)(ringRate * SkipFade)), tgt);
+            for (int i = 0; i < k; i++)
+            {
+                int a = (head + i) % len;
+                int b = (head + drop + i) % len;
+                ring[b] = ring[a] + (ring[b] - ring[a]) * ((float)i / k);
+            }
+            head = (head + drop) % len;
+            count -= drop;
+        }
+
+        // ---------- Ses iş parçacığı: Unity API'si çağırma ----------
+
         void OnPcmRead(float[] data)
         {
             int len = data.Length;
-            int got = 0;
+            float sumSq = 0f;
+            int played = 0;
+
             lock (sync)
             {
-                bool resumed = false;
-                if (!draining && count > 0 && (count >= prebufferSamples || flush)) { draining = true; resumed = true; }
-                if (draining)
+                if (ring == null || ringRate <= 0)
                 {
-                    got = Mathf.Min(count, len);
-                    int first = Mathf.Min(got, ring.Length - head);
-                    System.Array.Copy(ring, head, data, 0, first);
-                    if (first < got) System.Array.Copy(ring, 0, data, first, got - first);
-                    head = (head + got) % ring.Length;
-                    count -= got;
-                    if (count == 0) { draining = false; flush = false; } // tekrar ön-tamponlama
+                    System.Array.Clear(data, 0, len);
+                    level = 0f;
+                    return;
                 }
 
-                // Tıkırtı olmasın: yeniden başlarken yumuşak giriş, tampon bitince yumuşak çıkış
-                const int Fade = 96;
-                if (resumed)
+                float[] r = ring;
+                int L = r.Length;
+                float tgt = targetSeconds;
+
+                // Kayma düzeltme: tampon doluysa biraz hızlı, boşsa yavaş tüket
+                double ratio = 1.0;
+                if (driftEnabled && !flush && state == PlayState.Playing)
                 {
-                    int n = Mathf.Min(Fade, got);
-                    for (int i = 0; i < n; i++) data[i] *= (i + 1f) / n;
+                    float bufSec = (float)count / ringRate;
+                    float adj = (bufSec - tgt) / tgt * DriftMax;
+                    if (adj > DriftMax) adj = DriftMax; else if (adj < -DriftMax) adj = -DriftMax;
+                    ratio = 1.0 + adj;
                 }
-                if (got > 0 && got < len)
+                smoothRatio += (ratio - smoothRatio) * 0.2;
+                double step = (double)ringRate / sampleRate * smoothRatio;
+
+                int targetIn = System.Math.Max(3, (int)(tgt * ringRate));
+                int gapLimit = (int)(GapReprebuffer * sampleRate);
+                float fadeStep = 1f / System.Math.Max(1f, EdgeFade * sampleRate);
+
+                PlayState st = state;
+                int hd = head, cnt = count, gap = gapSamples;
+                double fr = frac;
+                float hs = hist, last = lastOut, fd = fade;
+                bool fl = flush;
+
+                for (int i = 0; i < len; i++)
                 {
-                    int n = Mathf.Min(Fade, got);
-                    for (int i = 0; i < n; i++) data[got - 1 - i] *= (i + 1f) / n;
+                    int need = fl ? 1 : 3;
+                    if (st == PlayState.Playing && cnt < need) { st = PlayState.Gap; gap = 0; }
+                    if (st == PlayState.Gap)
+                    {
+                        if (cnt >= need)
+                        {
+                            if (gap > gapLimit) st = PlayState.Prebuffer;          // yeni konuşma
+                            else { st = PlayState.Playing; underruns++; }          // akış ortasında tampon boşaldı
+                        }
+                        else
+                        {
+                            if (cnt == 0) fl = false;
+                            gap++;
+                            fd -= fadeStep; if (fd < 0f) fd = 0f;
+                            data[i] = last * fd; // son değeri tutarak ~5 ms'de sön
+                            continue;
+                        }
+                    }
+                    if (st == PlayState.Prebuffer)
+                    {
+                        if (cnt >= need && (cnt >= targetIn || fl)) st = PlayState.Playing;
+                        else { data[i] = 0f; fd = 0f; last = 0f; continue; }
+                    }
+
+                    // Dört noktalı kübik Hermite
+                    float pm = hs;
+                    float p0 = r[hd];
+                    int h1 = hd + 1; if (h1 >= L) h1 = 0;
+                    float p1 = cnt > 1 ? r[h1] : p0;
+                    int h2 = h1 + 1; if (h2 >= L) h2 = 0;
+                    float p2 = cnt > 2 ? r[h2] : p1;
+                    float f = (float)fr;
+                    float c1 = 0.5f * (p1 - pm);
+                    float c2 = pm - 2.5f * p0 + 2f * p1 - 0.5f * p2;
+                    float c3 = 0.5f * (p2 - pm) + 1.5f * (p0 - p1);
+                    float s = ((c3 * f + c2) * f + c1) * f + p0;
+
+                    fd += fadeStep; if (fd > 1f) fd = 1f;
+                    last = s;
+                    float o = s * fd;
+                    data[i] = o;
+                    sumSq += o * o;
+                    played++;
+
+                    fr += step;
+                    while (fr >= 1.0 && cnt > 0)
+                    {
+                        fr -= 1.0;
+                        hs = r[hd];
+                        hd++; if (hd >= L) hd = 0;
+                        cnt--;
+                    }
+                    if (fr >= 1.0) fr = 0.0;
+                }
+
+                state = st; head = hd; count = cnt; gapSamples = gap;
+                frac = fr; hist = hs; lastOut = last; fade = fd; flush = fl;
+            }
+
+            // Yumuşak sınırlayıcı: 0.9 üstünde x/(1+|x|) benzeri diz
+            for (int i = 0; i < len; i++)
+            {
+                float x = data[i];
+                float ax = x < 0f ? -x : x;
+                if (ax > 0.9f)
+                {
+                    float u = (ax - 0.9f) * 10f;
+                    ax = 0.9f + 0.1f * (u / (1f + u));
+                    data[i] = x < 0f ? -ax : ax;
                 }
             }
-            for (int i = got; i < len; i++) data[i] = 0f;
-
-            float sum = 0f;
-            for (int i = 0; i < got; i++) sum += data[i] * data[i];
-            level = got > 0 ? Mathf.Sqrt(sum / got) : 0f;
+            level = played > 0 ? (float)System.Math.Sqrt(sumSq / played) : 0f;
         }
+
+        // ---------- Ana iş parçacığı ----------
 
         void Update()
         {
             FeedStream();
+            AdaptTarget();
+
             if (Time.time >= nextCheck)
             {
                 nextCheck = Time.time + CheckInterval;
-                bool blocked = IsOccluded();
-                targetCutoff = blocked ? occludedCutoff : openCutoff;
+                var listener = FindListener();
+                bool blocked = listener != null && IsOccluded(listener);
+                float dist = listener != null ? Vector3.Distance(listener.transform.position, transform.position) : 0f;
+                float baseCut = blocked ? occludedCutoff : openCutoff;
+                targetCutoff = Mathf.Min(baseCut, AirCutoff(dist));
                 targetMul = blocked ? occludedVolume : 1f;
             }
 
             float t = 1f - Mathf.Exp(-10f * Time.deltaTime);
-            curCutoff = Mathf.Lerp(curCutoff, targetCutoff, t);
+            // Kesim frekansını logaritmik uzayda yumuşat
+            float lc = Mathf.Lerp(Mathf.Log(Mathf.Max(10f, curCutoff)), Mathf.Log(Mathf.Max(10f, targetCutoff)), t);
+            curCutoff = Mathf.Exp(lc);
             curMul = Mathf.Lerp(curMul, targetMul, t);
-            lowPass.cutoffFrequency = curCutoff;
+            lowPass.cutoffFrequency = Mathf.Clamp(curCutoff, 10f, 22000f);
             source.volume = Mathf.Clamp01(volume) * curMul;
         }
 
-        bool IsOccluded()
+        // 8 m'ye kadar açık, maxDistance'ta ~5 kHz (logaritmik)
+        float AirCutoff(float dist)
         {
-            var listener = FindListener();
-            if (listener == null) return false;
+            float t = Mathf.Clamp01((dist - AirNearDistance) / Mathf.Max(0.01f, maxDistance - AirNearDistance));
+            return openCutoff * Mathf.Pow(AirFarCutoff / openCutoff, t);
+        }
 
+        // Jitter hedefini uyarla: boşalmada artır, sakin akışta yavaşça azalt
+        void AdaptTarget()
+        {
+            int ur;
+            bool playing;
+            lock (sync)
+            {
+                ur = underruns;
+                underruns = 0;
+                playing = state == PlayState.Playing;
+            }
+            if (ur > 0)
+            {
+                calmTimer = 0f;
+                lock (sync) targetSeconds = Mathf.Min(TargetMax, targetSeconds + TargetStep * Mathf.Min(ur, 3));
+            }
+            else if (playing)
+            {
+                calmTimer += Time.unscaledDeltaTime;
+                if (calmTimer >= DecayInterval)
+                {
+                    calmTimer = 0f;
+                    lock (sync) targetSeconds = Mathf.Max(TargetMin, targetSeconds - TargetDecay);
+                }
+            }
+        }
+
+        bool IsOccluded(AudioListener listener)
+        {
             Vector3 from = listener.transform.position;
             Vector3 to = transform.position;
             Vector3 dir = to - from;

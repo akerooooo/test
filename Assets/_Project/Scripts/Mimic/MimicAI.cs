@@ -181,16 +181,66 @@ namespace MimicGame.Mimic
 
         // ---------- Konuşma ----------
 
+        // Klip paketleri RPC ile birlikte gider (Reliable = parçalı+sıralı, boyut sınırı yok);
+        // böylece her istemci klibi önbelleğe ihtiyaç duymadan çalar.
         [Rpc(SendTo.Everyone, Delivery = RpcDelivery.Reliable, InvokePermission = RpcInvokePermission.Server)]
-        void SpeakRpc(ulong speakerClientId, int clipId)
+        void SpeakRpc(ulong speakerClientId, int clipId, byte[] blob)
         {
             if (voicePlayer == null) return;
-            if (!VoiceClipLibrary.TryGet(speakerClientId, clipId, out var clip))
+            if (!TryParseBlob(blob, speakerClientId, clipId, out var clip))
             {
-                Debug.LogWarning("[Taklitçi] Klip bu makinede yok: konuşmacı " + speakerClientId + ", klip " + clipId);
+                Debug.LogWarning("[Taklitçi] Klip verisi çözülemedi: konuşmacı " + speakerClientId + ", klip " + clipId);
                 return;
             }
             voicePlayer.PlayClip(clip);
+        }
+
+        // blob = her paket için [codec(1) | uzunluk(ushort LE) | bayt...]
+        static byte[] BuildBlob(VoiceClip clip)
+        {
+            int total = 0;
+            var pk = clip.packets;
+            for (int i = 0; i < pk.Count; i++)
+            {
+                var d = pk[i].data;
+                if (d == null || d.Length == 0 || d.Length > ushort.MaxValue) continue;
+                total += 3 + d.Length;
+            }
+            var blob = new byte[total];
+            int o = 0;
+            for (int i = 0; i < pk.Count; i++)
+            {
+                var d = pk[i].data;
+                if (d == null || d.Length == 0 || d.Length > ushort.MaxValue) continue;
+                blob[o++] = pk[i].codec;
+                blob[o++] = (byte)(d.Length & 0xFF);
+                blob[o++] = (byte)((d.Length >> 8) & 0xFF);
+                System.Buffer.BlockCopy(d, 0, blob, o, d.Length);
+                o += d.Length;
+            }
+            return blob;
+        }
+
+        static bool TryParseBlob(byte[] blob, ulong speaker, int clipId, out VoiceClip clip)
+        {
+            clip = null;
+            if (blob == null || blob.Length < 4) return false;
+            var packets = new List<(byte codec, byte[] data)>(64);
+            int o = 0;
+            while (o + 3 <= blob.Length)
+            {
+                byte codec = blob[o];
+                int len = blob[o + 1] | (blob[o + 2] << 8);
+                o += 3;
+                if (len <= 0 || o + len > blob.Length) break; // bozuk/kesik veri
+                var data = new byte[len];
+                System.Buffer.BlockCopy(blob, o, data, 0, len);
+                o += len;
+                packets.Add((codec, data));
+            }
+            if (packets.Count == 0) return false;
+            clip = new VoiceClip { speakerClientId = speaker, id = clipId, packets = packets };
+            return true;
         }
 
         // ---------- Sunucu ----------
@@ -828,7 +878,7 @@ namespace MimicGame.Mimic
             lookOverrideUntil = now + pick.duration + 0.5f;
             lastReason = "konuştu: " + ctx + ", klip " + pick.id + ", kurban " + victim.OwnerClientId;
             Debug.Log("[Taklitçi] Konuşuyor: kimlik " + id + ", klip " + pick.id + ", kurban " + victim.OwnerClientId + " (" + ctx + ", " + pick.duration.ToString("0.0") + " sn)");
-            SpeakRpc(id, pick.id);
+            SpeakRpc(id, pick.id, BuildBlob(pick));
             return true;
         }
 
