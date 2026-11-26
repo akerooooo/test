@@ -1,0 +1,20 @@
+# Unreal Engine
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+Build/
+.vs/
+.idea/
+*.sln
+*.suo
+*.sdf
+*.VC.db
+*.opensdf
+*.xcworkspace
+Plugins/**/Binaries/
+Plugins/**/Intermediate/
+
+# OS
+.DS_Store
+Thumbs.db
