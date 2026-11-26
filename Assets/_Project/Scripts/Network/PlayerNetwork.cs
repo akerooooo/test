@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using MimicGame.Items;
 using MimicGame.Player;
+using MimicGame.UI;
 using Unity.Netcode;
 using Unity.Netcode.Components;
 using UnityEngine;
