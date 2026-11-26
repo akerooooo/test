@@ -55,6 +55,7 @@ namespace MimicGame.EditorTools
             BuildMenuCamera();
 
             EditorSceneManager.SaveScene(scene, ScenePath);
+            RefreshNetworkObjectIds();
             AddToBuildSettings(ScenePath);
             Debug.Log("Test sahnesi oluşturuldu: " + ScenePath + " — Play'e basıp deneyebilirsin.");
         }
@@ -381,6 +382,28 @@ namespace MimicGame.EditorTools
             else mat.color = color;
             EditorUtility.SetDirty(mat);
             return mat;
+        }
+
+        /// <summary>
+        /// Sahnedeki NetworkObject kimlikleri (GlobalObjectIdHash) kaydedilmemiş sahnede doğru
+        /// üretilemez. Sahneyi kaydettikten sonra yeniden açıp kimlikleri yenileyip tekrar kaydeder.
+        /// </summary>
+        static void RefreshNetworkObjectIds()
+        {
+            var reopened = EditorSceneManager.OpenScene(ScenePath, OpenSceneMode.Single);
+            var onValidate = typeof(NetworkObject).GetMethod("OnValidate",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Public);
+            foreach (var root in reopened.GetRootGameObjects())
+            {
+                foreach (var no in root.GetComponentsInChildren<NetworkObject>(true))
+                {
+                    onValidate?.Invoke(no, null);
+                    EditorUtility.SetDirty(no);
+                }
+            }
+            EditorSceneManager.MarkSceneDirty(reopened);
+            EditorSceneManager.SaveScene(reopened);
         }
 
         static void AddToBuildSettings(string path)
