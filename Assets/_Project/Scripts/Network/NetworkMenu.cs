@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+using Steamworks;
 using Unity.Netcode;
 using Unity.Netcode.Transports.UTP;
 using UnityEngine;
@@ -12,6 +14,11 @@ namespace MimicGame.Network
         string status = "";
         string lobbyIdText = "";
         int tab = -1; // 0 = Steam, 1 = Yerel (IP)
+
+        // Oyun içi arkadaş paneli (overlay yokken)
+        static bool friendsPanelOpen;
+        List<Friend> friends = new List<Friend>();
+        Vector2 friendsScroll;
 
         GUIStyle labelStyle, centerStyle, fieldStyle, buttonStyle;
         float styleScale = -1f;
@@ -40,6 +47,7 @@ namespace MimicGame.Network
             // Host için yalnızca kendi bağlantısı önemli
             if (nm.IsServer && clientId != nm.LocalClientId) return;
             string reason = nm.DisconnectReason;
+            friendsPanelOpen = false;
             status = string.IsNullOrEmpty(reason) ? "Bağlantı kesildi veya kurulamadı." : "Bağlantı kesildi: " + reason;
             if (SteamLobby.Instance != null) { SteamLobby.Instance.SetStatus(status); SteamLobby.Instance.Leave(); }
             MenuCamera.SetActive(true);
@@ -77,6 +85,7 @@ namespace MimicGame.Network
                     {
                         nm.Shutdown();
                         if (SteamLobby.Instance != null) SteamLobby.Instance.Leave();
+                        friendsPanelOpen = false;
                         status = "";
                         MenuCamera.SetActive(true);
                         Cursor.lockState = CursorLockMode.None;
@@ -85,15 +94,26 @@ namespace MimicGame.Network
                     if (HasHostLobby())
                     {
                         var lobby = SteamLobby.Instance;
-                        if (GUI.Button(InviteRect(), "Arkadaş Davet Et", buttonStyle)) lobby.InviteFriends();
+                        if (GUI.Button(InviteRect(), "Arkadaş Davet Et", buttonStyle))
+                        {
+                            // Overlay yoksa oyun içi listeyi aç/kapat
+                            if (!lobby.InviteFriends())
+                            {
+                                friendsPanelOpen = !friendsPanelOpen;
+                                if (friendsPanelOpen) friends = lobby.GetOnlineFriends();
+                            }
+                        }
                         string id = ((ulong)lobby.CurrentLobby.Value.Id).ToString();
                         var idRect = IdRect();
                         GUI.Label(idRect, "Lobi ID: " + id, new GUIStyle(labelStyle) { alignment = TextAnchor.MiddleRight, fontSize = Mathf.RoundToInt(16f * s) });
                         if (GUI.Button(CopyRect(), "Kopyala", buttonStyle)) GUIUtility.systemCopyBuffer = id;
+                        if (friendsPanelOpen) DrawFriendsPanel(lobby, s);
                     }
+                    else friendsPanelOpen = false;
                 }
                 return;
             }
+            friendsPanelOpen = false;
 
             bool connecting = nm.IsListening;
             if (tab < 0) tab = SteamBootstrap.Available ? 0 : 1;
@@ -130,6 +150,50 @@ namespace MimicGame.Network
             var small = new GUIStyle(centerStyle) { wordWrap = true, fontSize = Mathf.RoundToInt(18f * s) };
             if (tab == 0) DrawSteamTab(x, y, w, h, gap, s, small);
             else DrawLocalTab(nm, x, y, w, h, gap, small);
+        }
+
+        void DrawFriendsPanel(SteamLobby lobby, float s)
+        {
+            var panel = FriendsRect();
+            GUI.color = new Color(0f, 0f, 0f, 0.85f);
+            GUI.DrawTexture(panel, Texture2D.whiteTexture);
+            GUI.color = Color.white;
+
+            float pad = 14f * s, bh = 40f * s, rowH = 44f * s;
+            float x = panel.x + pad, w = panel.width - pad * 2f, y = panel.y + pad;
+            GUI.Label(new Rect(x, y, w, 36f * s), "Arkadaşlar", centerStyle);
+            y += 40f * s;
+
+            float bw = (w - 10f * s) * 0.5f;
+            if (GUI.Button(new Rect(x, y, bw, bh), "Yenile", buttonStyle)) friends = lobby.GetOnlineFriends();
+            if (GUI.Button(new Rect(x + bw + 10f * s, y, bw, bh), "Kapat", buttonStyle)) { friendsPanelOpen = false; return; }
+            y += bh + 10f * s;
+
+            float statusH = 50f * s;
+            var view = new Rect(x, y, w, panel.yMax - pad - statusH - y);
+            if (friends == null || friends.Count == 0)
+            {
+                GUI.Label(view, "Çevrimiçi arkadaş yok.", centerStyle);
+            }
+            else
+            {
+                var content = new Rect(0f, 0f, w - 20f * s, friends.Count * rowH);
+                friendsScroll = GUI.BeginScrollView(view, friendsScroll, content);
+                var nameStyle = new GUIStyle(labelStyle) { alignment = TextAnchor.MiddleLeft, fontSize = Mathf.RoundToInt(18f * s), clipping = TextClipping.Clip };
+                float btnW = 90f * s;
+                for (int i = 0; i < friends.Count; i++)
+                {
+                    var f = friends[i];
+                    string label = f.IsPlayingThisGame ? f.Name + " (oyunda)" : f.Name;
+                    GUI.Label(new Rect(0f, i * rowH, content.width - btnW - 6f * s, rowH), label, nameStyle);
+                    if (GUI.Button(new Rect(content.width - btnW, i * rowH + 3f * s, btnW, rowH - 6f * s), "Davet", buttonStyle))
+                        lobby.InviteFriend(f);
+                }
+                GUI.EndScrollView();
+            }
+
+            var small = new GUIStyle(labelStyle) { wordWrap = true, alignment = TextAnchor.MiddleCenter, fontSize = Mathf.RoundToInt(16f * s) };
+            GUI.Label(new Rect(x, panel.yMax - pad - statusH, w, statusH), lobby.Status, small);
         }
 
         void DrawSteamTab(float x, float y, float w, float h, float gap, float s, GUIStyle small)
@@ -221,6 +285,7 @@ namespace MimicGame.Network
             var p = new Vector2(mousePos.x, Screen.height - mousePos.y);
             if (DisconnectRect().Contains(p)) return true;
             if (HasHostLobby() && (InviteRect().Contains(p) || CopyRect().Contains(p))) return true;
+            if (friendsPanelOpen && HasHostLobby() && FriendsRect().Contains(p)) return true;
             return false;
         }
 
@@ -229,6 +294,14 @@ namespace MimicGame.Network
             float s = Screen.height / 1080f;
             float w = 240f * s, h = 44f * s;
             return new Rect(Screen.width - w - 20f * s, 20f * s + row * (h + 8f * s), w, h);
+        }
+
+        // Arkadaş paneli: düğme sütununun soluna (GUI koordinatı, y aşağı)
+        public static Rect FriendsRect()
+        {
+            float s = Screen.height / 1080f;
+            float w = 420f * s, h = 560f * s;
+            return new Rect(Screen.width - 240f * s - 40f * s - w, 20f * s, w, h);
         }
 
         public static Rect InviteRect() => RowRect(1);

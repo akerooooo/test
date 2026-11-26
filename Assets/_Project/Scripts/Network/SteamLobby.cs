@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Netcode.Transports.Facepunch;
 using Steamworks;
 using Steamworks.Data;
@@ -143,10 +144,51 @@ namespace MimicGame.Network
             Status = "";
         }
 
-        public void InviteFriends()
+        /// <summary>Steam overlay açıldıysa true; overlay yoksa false (oyun içi liste kullanılmalı).</summary>
+        public bool InviteFriends()
         {
-            if (CurrentLobby.HasValue && SteamBootstrap.Available)
+            if (!CurrentLobby.HasValue || !SteamBootstrap.Available) return false;
+            try
+            {
+                if (!SteamUtils.IsOverlayEnabled) return false;
                 SteamFriends.OpenGameInviteOverlay(CurrentLobby.Value.Id);
+                return true;
+            }
+            catch (Exception e) { Debug.LogWarning(e); return false; }
+        }
+
+        /// <summary>Çevrimiçi arkadaşlar: önce bu oyunu oynayanlar, sonra isme göre.</summary>
+        public List<Friend> GetOnlineFriends()
+        {
+            var list = new List<Friend>();
+            if (!SteamBootstrap.Available) return list;
+            try
+            {
+                foreach (var f in SteamFriends.GetFriends())
+                    if (f.IsOnline) list.Add(f);
+                list.Sort((a, b) =>
+                {
+                    if (a.IsPlayingThisGame != b.IsPlayingThisGame) return a.IsPlayingThisGame ? -1 : 1;
+                    return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+                });
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning(e);
+                list.Clear();
+            }
+            return list;
+        }
+
+        /// <summary>Arkadaşı doğrudan lobiye davet eder (overlay gerekmez).</summary>
+        public bool InviteFriend(Friend f)
+        {
+            if (!CurrentLobby.HasValue) { Status = "Davet gönderilemedi."; return false; }
+            bool ok = false;
+            try { ok = CurrentLobby.Value.InviteFriend(f.Id); }
+            catch (Exception e) { Debug.LogWarning(e); }
+            Status = ok ? $"Davet gönderildi: {f.Name}" : "Davet gönderilemedi.";
+            return ok;
         }
 
         // ---------- Katılma ----------
