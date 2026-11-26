@@ -54,7 +54,7 @@ namespace MimicGame.Network
         void Start()
         {
             // Oyun kapalıyken davetle açıldıysa
-            var args = Environment.GetCommandLineArgs();
+            var args = System.Environment.GetCommandLineArgs();
             for (int i = 0; i < args.Length - 1; i++)
             {
                 if (args[i] == "+connect_lobby" && ulong.TryParse(args[i + 1], out ulong id))

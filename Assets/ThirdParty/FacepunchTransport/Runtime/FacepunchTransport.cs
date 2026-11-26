@@ -20,7 +20,9 @@ namespace Netcode.Transports.Facepunch
 
         [Space]
         [Tooltip("The Steam App ID of your game. Technically you're not allowed to use 480, but Valve doesn't do anything about it so it's fine for testing purposes.")]
+#pragma warning disable 0414 // Steam'i SteamBootstrap başlatıyor
         [SerializeField] private uint steamAppId = 480;
+#pragma warning restore 0414
 
         [Tooltip("The Steam ID of the user targeted when joining as a client.")]
         [SerializeField] public ulong targetSteamId;

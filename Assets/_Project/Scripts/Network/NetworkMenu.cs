@@ -180,7 +180,7 @@ namespace MimicGame.Network
             y += h + gap;
 
             if (!string.IsNullOrEmpty(status))
-                GUI.Label(new Rect(x, y, w, 60f * s), status, small);
+                GUI.Label(new Rect(x, y, w, h * 1.5f), status, small);
         }
 
         void Begin(NetworkManager nm, bool host)
