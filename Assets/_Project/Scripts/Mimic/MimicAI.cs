@@ -108,7 +108,7 @@ namespace MimicGame.Mimic
         float speakingUntil;
         float nextAgentTry;
         int agentFailCount;
-        readonly NavMeshPath tmpPath = new NavMeshPath();
+        NavMeshPath tmpPath; // Awake içinde oluşturulur (alan başlatıcısında yasak)
 
         // Tanı
         string lastReason = "-";
@@ -117,6 +117,7 @@ namespace MimicGame.Mimic
 
         void Awake()
         {
+            tmpPath = new NavMeshPath();
             agent = GetComponent<NavMeshAgent>();
             if (agent != null)
             {
