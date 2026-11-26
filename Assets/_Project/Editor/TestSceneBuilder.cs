@@ -4,6 +4,7 @@ using MimicGame.Game;
 using MimicGame.Items;
 using MimicGame.Network;
 using MimicGame.Player;
+using Netcode.Transports.Facepunch;
 using MimicGame.UI;
 using Unity.Netcode;
 using Unity.Netcode.Components;
@@ -230,6 +231,7 @@ namespace MimicGame.EditorTools
             var go = new GameObject("NetworkManager");
             var nm = go.AddComponent<NetworkManager>();
             var utp = go.AddComponent<UnityTransport>();
+            go.AddComponent<FacepunchTransport>(); // Steam için; varsayılan UnityTransport kalır
             if (nm.NetworkConfig == null) nm.NetworkConfig = new NetworkConfig();
             nm.NetworkConfig.NetworkTransport = utp;
             nm.NetworkConfig.PlayerPrefab = playerPrefab;

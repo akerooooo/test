@@ -10,6 +10,8 @@ namespace MimicGame.Network
         string ip = "127.0.0.1";
         string portText = "7777";
         string status = "";
+        string lobbyIdText = "";
+        int tab = -1; // 0 = Steam, 1 = Yerel (IP)
 
         GUIStyle labelStyle, centerStyle, fieldStyle, buttonStyle;
         float styleScale = -1f;
@@ -39,6 +41,7 @@ namespace MimicGame.Network
             if (nm.IsServer && clientId != nm.LocalClientId) return;
             string reason = nm.DisconnectReason;
             status = string.IsNullOrEmpty(reason) ? "Bağlantı kesildi veya kurulamadı." : "Bağlantı kesildi: " + reason;
+            if (SteamLobby.Instance != null) { SteamLobby.Instance.SetStatus(status); SteamLobby.Instance.Leave(); }
             MenuCamera.SetActive(true);
         }
 
@@ -49,6 +52,8 @@ namespace MimicGame.Network
             Subscribe();
             var nm = NetworkManager.Singleton;
             if (nm == null) return;
+            if (Connected(nm) && SteamLobby.Instance != null && !string.IsNullOrEmpty(SteamLobby.Instance.Status))
+                SteamLobby.Instance.SetStatus("");
             // Menü açıkken imleç serbest
             if (!Connected(nm))
             {
@@ -66,21 +71,35 @@ namespace MimicGame.Network
 
             if (Connected(nm))
             {
-                if (Cursor.lockState != CursorLockMode.Locked &&
-                    GUI.Button(DisconnectRect(), "Bağlantıyı Kes", buttonStyle))
+                if (Cursor.lockState != CursorLockMode.Locked)
                 {
-                    nm.Shutdown();
-                    status = "";
-                    MenuCamera.SetActive(true);
-                    Cursor.lockState = CursorLockMode.None;
-                    Cursor.visible = true;
+                    if (GUI.Button(DisconnectRect(), "Bağlantıyı Kes", buttonStyle))
+                    {
+                        nm.Shutdown();
+                        if (SteamLobby.Instance != null) SteamLobby.Instance.Leave();
+                        status = "";
+                        MenuCamera.SetActive(true);
+                        Cursor.lockState = CursorLockMode.None;
+                        Cursor.visible = true;
+                    }
+                    if (HasHostLobby())
+                    {
+                        var lobby = SteamLobby.Instance;
+                        if (GUI.Button(InviteRect(), "Arkadaş Davet Et", buttonStyle)) lobby.InviteFriends();
+                        string id = ((ulong)lobby.CurrentLobby.Value.Id).ToString();
+                        var idRect = IdRect();
+                        GUI.Label(idRect, "Lobi ID: " + id, new GUIStyle(labelStyle) { alignment = TextAnchor.MiddleRight, fontSize = Mathf.RoundToInt(16f * s) });
+                        if (GUI.Button(CopyRect(), "Kopyala", buttonStyle)) GUIUtility.systemCopyBuffer = id;
+                    }
                 }
                 return;
             }
 
             bool connecting = nm.IsListening;
+            if (tab < 0) tab = SteamBootstrap.Available ? 0 : 1;
             var white = Texture2D.whiteTexture;
-            var panel = new Rect((Screen.width - 520f * s) * 0.5f, (Screen.height - 520f * s) * 0.5f, 520f * s, 520f * s);
+            float ph = (tab == 0 ? 600f : 560f) * s;
+            var panel = new Rect((Screen.width - 520f * s) * 0.5f, (Screen.height - ph) * 0.5f, 520f * s, ph);
             GUI.color = new Color(0f, 0f, 0f, 0.75f);
             GUI.DrawTexture(panel, white);
             GUI.color = Color.white;
@@ -96,11 +115,56 @@ namespace MimicGame.Network
                 if (GUI.Button(new Rect(x, y, w, h), "İptal", buttonStyle))
                 {
                     nm.Shutdown();
+                    if (SteamLobby.Instance != null) SteamLobby.Instance.Leave();
                     status = "";
                 }
                 return;
             }
 
+            // Sekmeler
+            float tw = (w - gap) * 0.5f;
+            if (GUI.Toggle(new Rect(x, y, tw, h), tab == 0, "Steam", buttonStyle)) tab = 0;
+            if (GUI.Toggle(new Rect(x + tw + gap, y, tw, h), tab == 1, "Yerel (IP)", buttonStyle)) tab = 1;
+            y += h + gap * 2f;
+
+            var small = new GUIStyle(centerStyle) { wordWrap = true, fontSize = Mathf.RoundToInt(18f * s) };
+            if (tab == 0) DrawSteamTab(x, y, w, h, gap, s, small);
+            else DrawLocalTab(nm, x, y, w, h, gap, small);
+        }
+
+        void DrawSteamTab(float x, float y, float w, float h, float gap, float s, GUIStyle small)
+        {
+            var lobby = SteamLobby.Instance;
+            if (!SteamBootstrap.Available || lobby == null)
+            {
+                GUI.Label(new Rect(x, y, w, 80f * s), SteamBootstrap.Error, small);
+                return;
+            }
+
+            GUI.Label(new Rect(x, y, w, h), "Steam: " + SteamBootstrap.PlayerName, centerStyle);
+            y += h + gap;
+            if (GUI.Button(new Rect(x, y, w, h), "Oyun Kur (Steam)", buttonStyle)) lobby.HostAsync();
+            y += h + gap * 2f;
+
+            GUI.Label(new Rect(x, y, w, h * 0.7f), "Lobi ID", labelStyle);
+            y += h * 0.7f;
+            lobbyIdText = GUI.TextField(new Rect(x, y, w, h), lobbyIdText, 24, fieldStyle);
+            y += h + gap;
+            if (GUI.Button(new Rect(x, y, w, h), "Lobi ID ile Katıl", buttonStyle))
+            {
+                if (ulong.TryParse(lobbyIdText.Trim(), out ulong id)) lobby.JoinLobbyById(id);
+                else lobby.SetStatus("Geçersiz lobi ID.");
+            }
+            y += h + gap;
+
+            GUI.Label(new Rect(x, y, w, 50f * s), "Arkadaşların Steam'den davetini kabul ederek de katılabilir.", small);
+            y += 54f * s;
+            if (!string.IsNullOrEmpty(lobby.Status))
+                GUI.Label(new Rect(x, y, w, 60f * s), lobby.Status, small);
+        }
+
+        void DrawLocalTab(NetworkManager nm, float x, float y, float w, float h, float gap, GUIStyle small)
+        {
             GUI.Label(new Rect(x, y, w, h * 0.7f), "IP adresi", labelStyle);
             y += h * 0.7f;
             ip = GUI.TextField(new Rect(x, y, w, h), ip, 64, fieldStyle);
@@ -116,11 +180,12 @@ namespace MimicGame.Network
             y += h + gap;
 
             if (!string.IsNullOrEmpty(status))
-                GUI.Label(new Rect(x, y, w, 60f * s), status, new GUIStyle(centerStyle) { wordWrap = true, fontSize = Mathf.RoundToInt(18f * s) });
+                GUI.Label(new Rect(x, y, w, 60f * s), status, small);
         }
 
         void Begin(NetworkManager nm, bool host)
         {
+            if (SteamLobby.Instance != null) SteamLobby.Instance.UseUnityTransport();
             var utp = nm.GetComponent<UnityTransport>();
             if (utp == null) utp = nm.NetworkConfig.NetworkTransport as UnityTransport;
             if (utp == null) { status = "UnityTransport bulunamadı."; return; }
@@ -154,7 +219,28 @@ namespace MimicGame.Network
         public static bool PointerOverButton(Vector2 mousePos)
         {
             var p = new Vector2(mousePos.x, Screen.height - mousePos.y);
-            return DisconnectRect().Contains(p);
+            if (DisconnectRect().Contains(p)) return true;
+            if (HasHostLobby() && (InviteRect().Contains(p) || CopyRect().Contains(p))) return true;
+            return false;
+        }
+
+        static Rect RowRect(int row)
+        {
+            float s = Screen.height / 1080f;
+            float w = 240f * s, h = 44f * s;
+            return new Rect(Screen.width - w - 20f * s, 20f * s + row * (h + 8f * s), w, h);
+        }
+
+        public static Rect InviteRect() => RowRect(1);
+        static Rect IdRect() => RowRect(2);
+        public static Rect CopyRect() => RowRect(3);
+
+        // Host mu ve açık bir Steam lobisi var mı
+        static bool HasHostLobby()
+        {
+            var nm = NetworkManager.Singleton;
+            var l = SteamLobby.Instance;
+            return nm != null && nm.IsHost && l != null && l.CurrentLobby.HasValue;
         }
 
         void EnsureStyles(float s)
