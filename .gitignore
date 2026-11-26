@@ -34,3 +34,7 @@ steam_appid.txt
 # OS
 .DS_Store
 Thumbs.db
+
+# Model paketinin Unity dışı kopyaları (GitHub'a gitmesin)
+/GLB/
+/glb/
