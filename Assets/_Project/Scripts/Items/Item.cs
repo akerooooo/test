@@ -5,7 +5,7 @@ using UnityEngine;
 
 namespace MimicGame.Items
 {
-    /// <summary>Yerden alınabilen, değeri ve ağırlığı olan ganimet.</summary>
+    /// <summary>Yerden alınabilen, değeri ve ağırlığı olan ganimet. Fizik simülasyonu yok.</summary>
     [RequireComponent(typeof(Rigidbody))]
     public class Item : MonoBehaviour, IInteractable
     {
@@ -19,6 +19,8 @@ namespace MimicGame.Items
 
         public bool IsHeld { get; private set; }
 
+        static readonly RaycastHit[] hitBuffer = new RaycastHit[16];
+
         Rigidbody rb;
         Collider[] colliders;
         Renderer[] renderers;
@@ -26,12 +28,22 @@ namespace MimicGame.Items
         void Awake()
         {
             rb = GetComponent<Rigidbody>();
+            rb.isKinematic = true;
+            rb.useGravity = false;
             colliders = GetComponentsInChildren<Collider>();
             renderers = GetComponentsInChildren<Renderer>();
         }
 
-        void OnEnable() => All.Add(this);
+        void OnEnable()
+        {
+            All.Add(this);
+            foreach (var motor in PlayerMotor.All)
+                if (motor != null) IgnorePlayer(motor.Controller);
+        }
+
         void OnDisable() => All.Remove(this);
+
+        void Start() => PlaceOnGround(transform.position, transform.rotation);
 
         public string GetPrompt(PlayerInteractor interactor) => $"Al: {displayName} ({value}$)";
 
@@ -40,40 +52,60 @@ namespace MimicGame.Items
             if (interactor.Inventory != null) interactor.Inventory.TryPickup(this);
         }
 
+        /// <summary>Oyuncu CharacterController'ı ile çarpışmayı kapatır.</summary>
+        public void IgnorePlayer(CharacterController controller)
+        {
+            if (controller == null || colliders == null) return;
+            foreach (var c in colliders)
+                if (c != null) Physics.IgnoreCollision(c, controller, true);
+        }
+
         public void OnPickedUp(Transform hand)
         {
             IsHeld = true;
-            rb.isKinematic = true;
-            rb.interpolation = RigidbodyInterpolation.None;
             foreach (var c in colliders) c.enabled = false;
             transform.SetParent(hand, false);
             transform.localPosition = Vector3.zero;
             transform.localRotation = Quaternion.identity;
         }
 
-        public void OnDropped(Vector3 position, Vector3 velocity) =>
-            OnDropped(position, transform.rotation, velocity);
-
-        public void OnDropped(Vector3 position, Quaternion rotation, Vector3 velocity)
+        /// <summary>Eşyayı verilen noktanın altındaki zemine oturtur.</summary>
+        public void PlaceOnGround(Vector3 approxPosition, Quaternion rotation)
         {
             transform.SetParent(null, true);
-            transform.SetPositionAndRotation(position, rotation);
-            IsHeld = false;
-            SetVisible(true);
-            foreach (var c in colliders) c.enabled = true;
-            rb.isKinematic = false;
-            rb.interpolation = RigidbodyInterpolation.Interpolate;
-            rb.linearVelocity = velocity;
-            rb.angularVelocity = Vector3.zero;
-        }
+            transform.SetPositionAndRotation(approxPosition, rotation);
+            SetVisible(true); // bounds için renderer açık olmalı
 
-        /// <summary>Mevcut rotasyonla render sınırlarının yarı yüksekliği (renderer kapalıyken de geçerli).</summary>
-        public float GetHalfHeight()
-        {
-            float h = 0f;
+            // Pivottan alt noktaya mesafe
+            float minY = float.MaxValue;
             foreach (var r in renderers)
-                if (r != null) h = Mathf.Max(h, r.bounds.extents.y);
-            return h;
+                if (r != null) minY = Mathf.Min(minY, r.bounds.min.y);
+            float pivotToBottom = minY == float.MaxValue ? 0f : transform.position.y - minY;
+
+            // En yakın zemin (kendi collider'ları ve oyuncu hariç)
+            int count = Physics.RaycastNonAlloc(approxPosition + Vector3.up * 0.5f, Vector3.down, hitBuffer,
+                5f, ~0, QueryTriggerInteraction.Ignore);
+            bool found = false;
+            float best = float.MaxValue;
+            Vector3 point = approxPosition;
+            for (int i = 0; i < count; i++)
+            {
+                var hit = hitBuffer[i];
+                if (hit.collider is CharacterController) continue;
+                if (System.Array.IndexOf(colliders, hit.collider) >= 0) continue;
+                if (hit.distance < best)
+                {
+                    best = hit.distance;
+                    point = hit.point;
+                    found = true;
+                }
+            }
+
+            if (found)
+                transform.position = point + Vector3.up * (pivotToBottom + 0.005f);
+
+            IsHeld = false;
+            foreach (var c in colliders) c.enabled = true;
         }
 
         public void SetVisible(bool visible)

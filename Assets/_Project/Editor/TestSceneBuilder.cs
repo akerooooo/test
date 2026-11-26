@@ -196,10 +196,14 @@ namespace MimicGame.EditorTools
             go.transform.localScale = scale;
             go.GetComponent<Renderer>().sharedMaterial = Mat("Ganimet " + name, color);
 
+            // Küre/kapsül collider yerine kutu (yuvarlanmasın)
+            Object.DestroyImmediate(go.GetComponent<Collider>());
+            go.AddComponent<BoxCollider>();
+
             var rb = go.AddComponent<Rigidbody>();
             rb.mass = Mathf.Max(0.5f, weight);
-            rb.interpolation = RigidbodyInterpolation.Interpolate;
-            rb.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
+            rb.isKinematic = true;
+            rb.useGravity = false;
 
             var item = go.AddComponent<Item>();
             item.displayName = name;

@@ -1194,7 +1194,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::MimicGame.Player.PlayerInteractor
   viewPoint: {fileID: 28236573}
-  range: 2.5
+  range: 3.5
   mask:
     serializedVersion: 2
     m_Bits: 4294967295

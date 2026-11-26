@@ -8,7 +8,7 @@ namespace MimicGame.Player
     public class PlayerInteractor : MonoBehaviour
     {
         public Transform viewPoint;
-        public float range = 3f;
+        public float range = 3.5f;
         [Tooltip("Yedek hedefleme için küre yarıçapı.")]
         public float assistRadius = 0.3f;
         [Tooltip("Yedek hedefleme için en büyük açı (derece).")]

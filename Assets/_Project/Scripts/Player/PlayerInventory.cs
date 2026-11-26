@@ -77,18 +77,9 @@ namespace MimicGame.Player
                     QueryTriggerInteraction.Ignore))
                 distance = Mathf.Max(0f, wall.distance - 0.25f);
 
-            // Önce rotasyonu ayarla, sonra yüksekliği ölç
+            // Yaw rotasyonu; zemine oturtma Item içinde
             Quaternion rot = Quaternion.Euler(0f, Quaternion.LookRotation(fwd, Vector3.up).eulerAngles.y, 0f);
-            item.transform.rotation = rot;
-            float halfHeight = item.GetHalfHeight();
-
-            // Zemini bul ve eşyayı üstüne koy
-            Vector3 start = transform.position + fwd * distance + Vector3.up * 1.0f;
-            Vector3 pos = start;
-            if (Physics.Raycast(start, Vector3.down, out var floor, 3f, ~0, QueryTriggerInteraction.Ignore))
-                pos = floor.point + Vector3.up * (halfHeight + 0.02f);
-
-            item.OnDropped(pos, rot, Vector3.zero);
+            item.PlaceOnGround(transform.position + fwd * distance + Vector3.up * 0.3f, rot);
             RecalculateWeight();
         }
 

@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+using MimicGame.Items;
 using UnityEngine;
 
 namespace MimicGame.Player
@@ -43,6 +45,11 @@ namespace MimicGame.Player
         public float CurrentHeight => cc.height;
         public event System.Action Jumped;
 
+        /// <summary>Sahnedeki oyuncu hareketleri (eşya çarpışma yoksayma için).</summary>
+        public static readonly List<PlayerMotor> All = new List<PlayerMotor>();
+
+        public CharacterController Controller => cc != null ? cc : (cc = GetComponent<CharacterController>());
+
         CharacterController cc;
         PlayerInputReader input;
         Vector3 horizontalVelocity;
@@ -57,6 +64,16 @@ namespace MimicGame.Player
             stamina = maxStamina;
             SetHeight(standHeight);
         }
+
+        void OnEnable()
+        {
+            All.Add(this);
+            // Mevcut eşyalarla çarpışmayı kapat
+            foreach (var item in Item.All)
+                if (item != null) item.IgnorePlayer(Controller);
+        }
+
+        void OnDisable() => All.Remove(this);
 
         void Update()
         {
