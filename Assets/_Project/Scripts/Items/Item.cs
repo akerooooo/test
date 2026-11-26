@@ -30,6 +30,7 @@ namespace MimicGame.Items
             rb = GetComponent<Rigidbody>();
             rb.isKinematic = true;
             rb.useGravity = false;
+            rb.interpolation = RigidbodyInterpolation.None; // sahnede Interpolate kayıtlı olabilir; Transform ile taşıyoruz
             colliders = GetComponentsInChildren<Collider>();
             renderers = GetComponentsInChildren<Renderer>();
         }
@@ -67,6 +68,24 @@ namespace MimicGame.Items
             transform.SetParent(hand, false);
             transform.localPosition = Vector3.zero;
             transform.localRotation = Quaternion.identity;
+            Physics.SyncTransforms();
+        }
+
+        /// <summary>Tüm renderer'ların birleşik sınırı (hedefleme için).</summary>
+        public Bounds GetVisualBounds()
+        {
+            bool has = false;
+            Bounds b = default;
+            if (renderers != null)
+            {
+                foreach (var r in renderers)
+                {
+                    if (r == null) continue;
+                    if (!has) { b = r.bounds; has = true; }
+                    else b.Encapsulate(r.bounds);
+                }
+            }
+            return has ? b : new Bounds(transform.position, Vector3.one * 0.2f);
         }
 
         /// <summary>Eşyayı verilen noktanın altındaki zemine oturtur.</summary>
@@ -106,6 +125,7 @@ namespace MimicGame.Items
 
             IsHeld = false;
             foreach (var c in colliders) c.enabled = true;
+            Physics.SyncTransforms(); // collider'lar yeni konumda güncel olsun
         }
 
         public void SetVisible(bool visible)
