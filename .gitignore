@@ -1,19 +1,35 @@
-# Unreal Engine
-Binaries/
-DerivedDataCache/
-Intermediate/
-Saved/
-Build/
+# Unity
+/[Ll]ibrary/
+/[Tt]emp/
+/[Oo]bj/
+/[Bb]uild/
+/[Bb]uilds/
+/[Ll]ogs/
+/[Uu]ser[Ss]ettings/
+/[Mm]emoryCaptures/
+/[Rr]ecordings/
+/Assets/Plugins/Editor/JetBrains*
+*.pidb.meta
+*.pdb.meta
+*.mdb.meta
+sysinfo.txt
+crashlytics-buildid.txt
+*.apk
+*.aab
+*.unitypackage
+
+# IDE
 .vs/
+.vscode/
 .idea/
+*.csproj
 *.sln
 *.suo
-*.sdf
-*.VC.db
-*.opensdf
-*.xcworkspace
-Plugins/**/Binaries/
-Plugins/**/Intermediate/
+*.user
+*.userprefs
+
+# Steam test file (created locally)
+steam_appid.txt
 
 # OS
 .DS_Store
