@@ -1,7 +1,9 @@
+using System.Collections.Generic;
 using System.IO;
 using MimicGame.Environment;
 using MimicGame.Game;
 using MimicGame.Items;
+using MimicGame.Level;
 using MimicGame.Mimic;
 using MimicGame.Network;
 using MimicGame.Player;
@@ -17,14 +19,16 @@ using UnityEditor.SceneManagement;
 using UnityEngine;
 using UnityEngine.AI;
 using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
 using UnityEngine.SceneManagement;
 
 namespace MimicGame.EditorTools
 {
     /// <summary>
     /// Menü: MimicGame → Test Sahnesini Oluştur
-    /// Oyuncu, araç (ganimet alanı), karanlık bir bina, kapı ve ganimetlerle
-    /// bir test sahnesi kurar ve Assets/_Project/Scenes/TestScene.unity olarak kaydeder.
+    /// Oyuncu, araç (ganimet alanı), kapalı bir tesis cephesi (kapıdan prosedürel iç mekâna ışınlanılır),
+    /// gün batımı atmosferi, radyo istasyonu ögeleri ve ganimet prefabları ile test sahnesi kurar;
+    /// Assets/_Project/Scenes/TestScene.unity olarak kaydeder.
     /// </summary>
     public static class TestSceneBuilder
     {
@@ -32,9 +36,16 @@ namespace MimicGame.EditorTools
         const string ScenePath = SceneDir + "/TestScene.unity";
         const string MaterialDir = "Assets/_Project/Materials";
         const string PrefabDir = "Assets/_Project/Prefabs";
+        const string ItemPrefabDir = PrefabDir + "/Items";
+        const string SettingsDir = "Assets/_Project/Settings";
+        const string PostProfilePath = SettingsDir + "/PostProfile.asset";
+        const string LootTablePath = SettingsDir + "/LootTable.asset";
+        const string ModelsRoot = "Assets/ThirdParty/Models";
         const string PlayerPrefabPath = PrefabDir + "/Player.prefab";
         const string MimicPrefabPath = PrefabDir + "/Mimic.prefab";
         const string NetworkPrefabsListPath = "Assets/DefaultNetworkPrefabs.asset";
+
+        static readonly Vector3 FacilityCenter = new Vector3(0f, 0f, 20f);
 
         [MenuItem("MimicGame/Test Sahnesini Oluştur")]
         public static void Build()
@@ -48,6 +59,8 @@ namespace MimicGame.EditorTools
             Directory.CreateDirectory(SceneDir);
             Directory.CreateDirectory(MaterialDir);
             Directory.CreateDirectory(PrefabDir);
+            Directory.CreateDirectory(ItemPrefabDir);
+            Directory.CreateDirectory(SettingsDir);
             AssetDatabase.Refresh();
 
             var scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
@@ -55,12 +68,18 @@ namespace MimicGame.EditorTools
             SetupLighting();
             BuildGround();
             BuildVan(new Vector3(0f, 0f, -8f));
-            BuildFacility(new Vector3(0f, 0f, 20f));
+            BuildFacilityExterior(FacilityCenter);
+            BuildRadioStation();
+            BuildLampPosts();
+            BuildPostProcessing();
+            var itemPrefabs = BuildItemPrefabs(out var lootTable);
+            BuildFacilityGenerator(lootTable);
+            BuildAtmosphere();
             var playerPrefab = BuildPlayerPrefab();
             var mimicPrefab = BuildMimicPrefab();
             BuildNavMesh();
             BuildMimicDirector(mimicPrefab);
-            BuildNetwork(playerPrefab, mimicPrefab);
+            BuildNetwork(playerPrefab, mimicPrefab, itemPrefabs);
             BuildMenuCamera();
 
             EditorSceneManager.SaveScene(scene, ScenePath);
@@ -73,21 +92,96 @@ namespace MimicGame.EditorTools
 
         static void SetupLighting()
         {
+            // Ay / alacakaranlık ışığı: soğuk mavi, alçak açı (prosedürel gökyüzü de bu yönü kullanır)
             var moon = new GameObject("Ay Işığı");
             var l = moon.AddComponent<Light>();
             l.type = LightType.Directional;
-            l.intensity = 0.25f;
-            l.color = new Color(0.55f, 0.65f, 1f);
+            l.intensity = 0.35f;
+            l.color = new Color(0.55f, 0.62f, 0.9f);
             l.shadows = LightShadows.Soft;
-            moon.transform.rotation = Quaternion.Euler(35f, -40f, 0f);
+            moon.transform.rotation = Quaternion.Euler(22f, -40f, 0f);
 
-            RenderSettings.skybox = null;
-            RenderSettings.ambientMode = AmbientMode.Flat;
-            RenderSettings.ambientLight = new Color(0.035f, 0.035f, 0.045f);
+            // Koyu mor-mavi alacakaranlık gökyüzü
+            RenderSettings.skybox = BuildSkyMaterial();
+            RenderSettings.sun = l;
+            RenderSettings.ambientMode = AmbientMode.Trilight;
+            RenderSettings.ambientSkyColor = new Color(0.07f, 0.075f, 0.16f);
+            RenderSettings.ambientEquatorColor = new Color(0.05f, 0.05f, 0.09f);
+            RenderSettings.ambientGroundColor = new Color(0.015f, 0.015f, 0.02f);
             RenderSettings.fog = true;
             RenderSettings.fogMode = FogMode.ExponentialSquared;
-            RenderSettings.fogDensity = 0.035f;
-            RenderSettings.fogColor = new Color(0.02f, 0.02f, 0.03f);
+            RenderSettings.fogDensity = 0.025f;
+            RenderSettings.fogColor = new Color(0.06f, 0.07f, 0.1f);
+        }
+
+        static Material BuildSkyMaterial()
+        {
+            string path = MaterialDir + "/Gökyüzü.mat";
+            var mat = AssetDatabase.LoadAssetAtPath<Material>(path);
+            if (mat == null)
+            {
+                mat = new Material(Shader.Find("Skybox/Procedural"));
+                AssetDatabase.CreateAsset(mat, path);
+            }
+            mat.SetFloat("_SunSize", 0f);
+            mat.SetFloat("_SunDisk", 0f); // güneş diski yok
+            mat.DisableKeyword("_SUNDISK_SIMPLE");
+            mat.DisableKeyword("_SUNDISK_HIGH_QUALITY");
+            mat.EnableKeyword("_SUNDISK_NONE");
+            mat.SetFloat("_AtmosphereThickness", 0.6f);
+            mat.SetColor("_SkyTint", new Color(0.3f, 0.22f, 0.5f));
+            mat.SetColor("_GroundColor", new Color(0.02f, 0.02f, 0.035f));
+            mat.SetFloat("_Exposure", 0.35f);
+            EditorUtility.SetDirty(mat);
+            return mat;
+        }
+
+        // Küresel Volume: tonemapping, bloom, renk, vinyet, film greni
+        static void BuildPostProcessing()
+        {
+            AssetDatabase.DeleteAsset(PostProfilePath);
+            var profile = ScriptableObject.CreateInstance<VolumeProfile>();
+            AssetDatabase.CreateAsset(profile, PostProfilePath);
+
+            var tone = profile.Add<Tonemapping>(true);
+            tone.mode.Override(TonemappingMode.ACES);
+
+            var bloom = profile.Add<Bloom>(true);
+            bloom.threshold.Override(0.9f);
+            bloom.intensity.Override(0.6f);
+            bloom.scatter.Override(0.7f);
+
+            var color = profile.Add<ColorAdjustments>(true);
+            color.postExposure.Override(0.2f);
+            color.contrast.Override(10f);
+            color.saturation.Override(-5f);
+            color.colorFilter.Override(new Color(1f, 0.96f, 0.9f)); // hafif sıcak
+
+            var vignette = profile.Add<Vignette>(true);
+            vignette.intensity.Override(0.3f);
+
+            var grain = profile.Add<FilmGrain>(true);
+            grain.type.Override(FilmGrainLookup.Medium1);
+            grain.intensity.Override(0.25f);
+
+            // Bileşenler profilin alt varlığı olarak kaydedilmeli
+            foreach (var c in profile.components)
+                AssetDatabase.AddObjectToAsset(c, profile);
+            EditorUtility.SetDirty(profile);
+            AssetDatabase.SaveAssets();
+
+            var go = new GameObject("Post-Processing");
+            var volume = go.AddComponent<Volume>();
+            volume.isGlobal = true;
+            volume.priority = 1f;
+            volume.sharedProfile = profile;
+        }
+
+        static void EnablePostProcessing(Camera cam)
+        {
+            var data = cam.GetComponent<UniversalAdditionalCameraData>();
+            if (data == null) data = cam.gameObject.AddComponent<UniversalAdditionalCameraData>();
+            data.renderPostProcessing = true;
         }
 
         // ---------- Zemin ----------
@@ -97,8 +191,12 @@ namespace MimicGame.EditorTools
             var ground = GameObject.CreatePrimitive(PrimitiveType.Plane);
             ground.name = "Zemin";
             ground.transform.localScale = new Vector3(10f, 1f, 10f);
-            ground.GetComponent<Renderer>().sharedMaterial = Mat("Zemin", new Color(0.18f, 0.2f, 0.16f));
+            ground.GetComponent<Renderer>().sharedMaterial = Mat("Zemin", new Color(0.1f, 0.11f, 0.1f));
             ground.isStatic = true;
+
+            // Araçtan tesis kapısına beton yol
+            var path = Mat("Beton Yol", new Color(0.17f, 0.17f, 0.18f));
+            Box("Yol", null, new Vector3(0f, 0.015f, 1.75f), new Vector3(3.2f, 0.03f, 18.5f), path);
         }
 
         // ---------- Araç (ganimet alanı) ----------
@@ -135,109 +233,425 @@ namespace MimicGame.EditorTools
             zone.AddComponent<LootZone>();
         }
 
-        // ---------- Bina ----------
+        // ---------- Tesis cephesi (kapalı blok; iç mekân prosedürel ve haritanın altında) ----------
 
-        static void BuildFacility(Vector3 c)
+        static void BuildFacilityExterior(Vector3 c)
         {
             var root = new GameObject("Bina");
             root.transform.position = c;
             var t = root.transform;
-            var wall = Mat("Duvar", new Color(0.32f, 0.31f, 0.3f));
-            var floor = Mat("Bina Zemini", new Color(0.12f, 0.12f, 0.12f));
+            var wall = Mat("Dış Duvar Pas", new Color(0.26f, 0.2f, 0.16f));
+            var band = Mat("Dış Duvar Bant", new Color(0.16f, 0.15f, 0.15f));
+            var concrete = Mat("Beton", new Color(0.2f, 0.2f, 0.21f));
+            var yellow = Mat("Sarı Çizgi", new Color(0.85f, 0.68f, 0.08f));
+            var metal = Mat("Tesis Metal", new Color(0.24f, 0.26f, 0.27f));
+            var doorMat = Mat("Ana Kapı", new Color(0.14f, 0.2f, 0.17f));
+            var warm = EmissiveMat("Sıcak Pencere", new Color(0.3f, 0.2f, 0.1f), new Color(1.6f, 0.9f, 0.4f));
+            var sodium = EmissiveMat("Sodyum", new Color(0.9f, 0.5f, 0.2f), new Color(3f, 1.6f, 0.5f));
 
-            const float h = 4f, half = 10f, th = 0.3f;
+            // Ana blok: 20 x 8 x 20, yürünebilir iç mekânı yok
+            Box("Ana Gövde", t, new Vector3(0f, 4f, 0f), new Vector3(20f, 8f, 20f), wall);
+            Box("Kaide", t, new Vector3(0f, 0.15f, 0f), new Vector3(20.6f, 0.3f, 20.6f), concrete);
+            Deco("Üst Bant", t, new Vector3(0f, 6.6f, 0f), new Vector3(20.15f, 0.7f, 20.15f), band);
+            Deco("Alt Bant", t, new Vector3(0f, 1.6f, 0f), new Vector3(20.1f, 0.5f, 20.1f), band);
 
-            Box("Bina Zemini", t, new Vector3(0f, 0.02f, 0f), new Vector3(2 * half, 0.04f, 2 * half), floor);
-            var ceiling = Box("Tavan", t, new Vector3(0f, h + th * 0.5f, 0f), new Vector3(2 * half, th, 2 * half), wall);
-            IgnoreNavMesh(ceiling); // tavanın üstü yürünebilir yüzey sayılmasın
-            Box("Kuzey Duvarı", t, new Vector3(0f, h / 2, half), new Vector3(2 * half, h, th), wall);
-            Box("Doğu Duvarı", t, new Vector3(half, h / 2, 0f), new Vector3(th, h, 2 * half), wall);
-            Box("Batı Duvarı", t, new Vector3(-half, h / 2, 0f), new Vector3(th, h, 2 * half), wall);
+            // Çatı korkuluğu ve çatı eşyaları
+            Box("Korkuluk Kuzey", t, new Vector3(0f, 8.3f, 9.85f), new Vector3(20f, 0.6f, 0.3f), concrete);
+            Box("Korkuluk Güney", t, new Vector3(0f, 8.3f, -9.85f), new Vector3(20f, 0.6f, 0.3f), concrete);
+            Box("Korkuluk Doğu", t, new Vector3(9.85f, 8.3f, 0f), new Vector3(0.3f, 0.6f, 20f), concrete);
+            Box("Korkuluk Batı", t, new Vector3(-9.85f, 8.3f, 0f), new Vector3(0.3f, 0.6f, 20f), concrete);
+            Deco("Klima Ünitesi", t, new Vector3(5f, 8.7f, 3f), new Vector3(3f, 1.4f, 2f), metal);
+            Deco("Klima Ünitesi 2", t, new Vector3(-4f, 8.6f, -2f), new Vector3(2.5f, 1.2f, 2f), metal);
+            Cylinder("Baca", t, new Vector3(-6f, 9.5f, 5f), new Vector3(0.9f, 1.5f, 0.9f), metal, false);
 
-            // Güney duvarı, ortasında 2 m'lik kapı boşluğuyla
-            Box("Güney Duvarı Sol", t, new Vector3(-5.5f, h / 2, -half), new Vector3(9f, h, th), wall);
-            Box("Güney Duvarı Sağ", t, new Vector3(5.5f, h / 2, -half), new Vector3(9f, h, th), wall);
-            Box("Kapı Üstü", t, new Vector3(0f, 3.25f, -half), new Vector3(2f, 1.5f, th), wall);
+            // Ana kapı (güney yüz, z = 10 dünya konumunda)
+            float fz = -10f;
+            Deco("Kapı Direk Sol", t, new Vector3(-1.9f, 1.9f, fz - 0.2f), new Vector3(0.4f, 3.8f, 0.5f), concrete);
+            Deco("Kapı Direk Sağ", t, new Vector3(1.9f, 1.9f, fz - 0.2f), new Vector3(0.4f, 3.8f, 0.5f), concrete);
+            Deco("Kapı Üst Kiriş", t, new Vector3(0f, 3.9f, fz - 0.2f), new Vector3(4.2f, 0.4f, 0.5f), concrete);
+            Deco("Sundurma", t, new Vector3(0f, 4.5f, fz - 1.4f), new Vector3(6f, 0.2f, 2.8f), metal);
+            Deco("Uyarı Şeridi Sol", t, new Vector3(-2.35f, 1.7f, fz - 0.47f), new Vector3(0.25f, 3.4f, 0.04f), yellow);
+            Deco("Uyarı Şeridi Sağ", t, new Vector3(2.35f, 1.7f, fz - 0.47f), new Vector3(0.25f, 3.4f, 0.04f), yellow);
 
-            // İç duvarlar (koridorlar)
-            Box("İç Duvar 1", t, new Vector3(-3f, h / 2, -3f), new Vector3(th, h, 14f), wall);
-            Box("İç Duvar 2", t, new Vector3(3f, h / 2, 2f), new Vector3(th, h, 16f), wall);
-            // 3. duvar ile 1. duvar arasında 1.5 m geçit bırakılır (sol alt odaya giriş)
-            Box("İç Duvar 3", t, new Vector3(-7.25f, h / 2, 3f), new Vector3(5.5f, h, th), wall);
+            var panel = Box("Ana Kapı", t, new Vector3(0f, 1.7f, fz - 0.1f), new Vector3(3.2f, 3.4f, 0.2f), doorMat);
+            panel.AddComponent<FacilityDoor>(); // etkileşim: içeri gir
 
-            // Kapı
-            var hinge = new GameObject("Giriş Kapısı");
-            hinge.transform.SetParent(t, false);
-            hinge.transform.localPosition = new Vector3(-1f, 0f, -half);
-            // Sahnede yerleşik NetworkObject (üstünde başka NetworkObject yok)
-            hinge.AddComponent<NetworkObject>();
-            hinge.AddComponent<Door>();
-            var panel = Box("Kapı Paneli", hinge.transform, new Vector3(1f, 1.25f, 0f), new Vector3(1.95f, 2.5f, 0.08f),
-                Mat("Kapı", new Color(0.25f, 0.15f, 0.1f)));
-            panel.isStatic = false;
-            IgnoreNavMesh(panel); // kapalı kapı NavMesh'te boşluğu tıkamasın
+            // Kapı üstü lamba (sodyum)
+            Deco("Kapı Lambası", t, new Vector3(0f, 4.35f, fz - 0.55f), new Vector3(0.6f, 0.18f, 0.35f), metal);
+            Deco("Kapı Lambası Cam", t, new Vector3(0f, 4.24f, fz - 0.55f), new Vector3(0.45f, 0.04f, 0.25f), sodium);
+            var lampGo = new GameObject("Kapı Üstü Lamba Işığı");
+            lampGo.transform.SetParent(t, false);
+            lampGo.transform.localPosition = new Vector3(0f, 4.1f, fz - 0.8f);
+            lampGo.transform.localRotation = Quaternion.Euler(60f, 180f, 0f); // güneye ve aşağıya
+            var spot = lampGo.AddComponent<Light>();
+            spot.type = LightType.Spot;
+            spot.color = new Color(1f, 0.65f, 0.3f);
+            spot.intensity = 4f;
+            spot.range = 12f;
+            spot.spotAngle = 110f;
+            spot.innerSpotAngle = 60f;
+            spot.shadows = LightShadows.Soft;
 
-            // Titreyen lambalar
-            Lamp(t, new Vector3(0f, 3.6f, 2f));
-            Lamp(t, new Vector3(-6.5f, 3.6f, 7f));
-            Lamp(t, new Vector3(6.5f, 3.6f, -5f));
-
-            // Ganimetler
-            var items = t;
-            Loot("Eski Saat", 25, 1f, PrimitiveType.Cylinder, new Color(0.8f, 0.7f, 0.3f), new Vector3(0.3f, 0.05f, 0.3f), items, new Vector3(-6f, 0.5f, -6f));
-            Loot("Bakır Boru", 15, 6f, PrimitiveType.Cylinder, new Color(0.75f, 0.4f, 0.2f), new Vector3(0.12f, 0.6f, 0.12f), items, new Vector3(-7f, 0.7f, 6f));
-            Loot("Kırık Radyo", 40, 8f, PrimitiveType.Cube, new Color(0.3f, 0.25f, 0.2f), new Vector3(0.5f, 0.3f, 0.25f), items, new Vector3(-5f, 0.5f, 8f));
-            Loot("Oyuncak Ayı", 12, 1f, PrimitiveType.Sphere, new Color(0.6f, 0.4f, 0.25f), new Vector3(0.35f, 0.35f, 0.35f), items, new Vector3(0f, 0.5f, -2f));
-            Loot("Altın Kupa", 80, 5f, PrimitiveType.Cylinder, new Color(1f, 0.8f, 0.1f), new Vector3(0.3f, 0.25f, 0.3f), items, new Vector3(0f, 0.5f, 8f));
-            Loot("Teneke Kutu", 5, 1f, PrimitiveType.Cylinder, new Color(0.6f, 0.6f, 0.6f), new Vector3(0.15f, 0.12f, 0.15f), items, new Vector3(1.5f, 0.5f, -8f));
-            Loot("Fotoğraf Makinesi", 55, 2f, PrimitiveType.Cube, new Color(0.1f, 0.1f, 0.1f), new Vector3(0.3f, 0.2f, 0.15f), items, new Vector3(6f, 0.5f, -4f));
-            Loot("Akü", 30, 15f, PrimitiveType.Cube, new Color(0.15f, 0.3f, 0.15f), new Vector3(0.45f, 0.35f, 0.3f), items, new Vector3(7f, 0.5f, 4f));
-            Loot("Gümüş Tabak", 35, 2f, PrimitiveType.Cylinder, new Color(0.85f, 0.85f, 0.9f), new Vector3(0.4f, 0.02f, 0.4f), items, new Vector3(5f, 0.5f, 8f));
-            Loot("Eski Telefon", 20, 1f, PrimitiveType.Cube, new Color(0.5f, 0.1f, 0.1f), new Vector3(0.12f, 0.06f, 0.25f), items, new Vector3(-1.5f, 0.5f, 9f));
+            // Sönük sıcak pencere yarıkları
+            for (int i = 0; i < 4; i++)
+                Deco("Pencere " + (i + 1), t, new Vector3(-7.5f + i * 5f, 6.2f, fz - 0.1f), new Vector3(1.4f, 0.35f, 0.06f), warm);
         }
 
-        static void Lamp(Transform parent, Vector3 localPos)
+        // ---------- Radyo istasyonu: uydu çanağı + kafes direk + uçak ikaz ışıkları ----------
+
+        static void BuildRadioStation()
         {
-            var go = new GameObject("Lamba");
+            var root = new GameObject("Radyo İstasyonu");
+            var t = root.transform;
+            var metal = Mat("Çanak Metal", new Color(0.35f, 0.34f, 0.32f));
+            var rust = Mat("Kafes Pas", new Color(0.3f, 0.18f, 0.12f));
+            var red = EmissiveMat("Uçak Işığı", new Color(0.4f, 0.03f, 0.03f), new Color(4f, 0.2f, 0.15f));
+
+            // Büyük çanak (tesisin arkasında)
+            Vector3 b = new Vector3(-6f, 0f, 38f);
+            Cylinder("Çanak Direği", t, b + new Vector3(0f, 3f, 0f), new Vector3(0.5f, 3f, 0.5f), metal, true);
+            Deco("Çanak Tabanı", t, b + new Vector3(0f, 0.2f, 0f), new Vector3(2f, 0.4f, 2f), metal);
+
+            var pivot = new GameObject("Çanak");
+            pivot.transform.SetParent(t, false);
+            pivot.transform.position = b + new Vector3(0f, 6.4f, 0f);
+            pivot.transform.rotation = Quaternion.Euler(-55f, 30f, 0f); // gökyüzüne bakar
+            var pt = pivot.transform;
+
+            var dish = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            dish.name = "Çanak Tabağı";
+            Object.DestroyImmediate(dish.GetComponent<Collider>());
+            dish.transform.SetParent(pt, false);
+            dish.transform.localScale = new Vector3(7f, 0.9f, 7f); // yassı küre
+            dish.GetComponent<Renderer>().sharedMaterial = metal;
+
+            Vector3 focus = new Vector3(0f, 3.2f, 0f);
+            Strut("Besleme Kolu", pt, new Vector3(3.3f, 0.25f, 0f), focus, 0.08f, rust);
+            Strut("Besleme Kolu", pt, new Vector3(-3.3f, 0.25f, 0f), focus, 0.08f, rust);
+            Strut("Besleme Kolu", pt, new Vector3(0f, 0.25f, 3.3f), focus, 0.08f, rust);
+            Strut("Besleme Kolu", pt, new Vector3(0f, 0.25f, -3.3f), focus, 0.08f, rust);
+            Strut("Arka Kafes", pt, new Vector3(-3.2f, -0.2f, 0f), new Vector3(3.2f, -0.2f, 0f), 0.1f, rust);
+            Strut("Arka Kafes", pt, new Vector3(0f, -0.2f, -3.2f), new Vector3(0f, -0.2f, 3.2f), 0.1f, rust);
+            Strut("Çanak Desteği", pt, new Vector3(0f, -0.3f, 0f), new Vector3(0f, -1.0f, 0f), 0.2f, rust);
+            Cylinder("Besleme Kornası", pt, focus, new Vector3(0.3f, 0.2f, 0.3f), metal, false);
+
+            // Çanağın üstündeki küçük kırmızı ikaz ışığı
+            MakeBlinker("Çanak İkaz Işığı", pt, focus + new Vector3(0f, 0.35f, 0f), red);
+
+            // Kafes direk
+            Vector3 m = new Vector3(11f, 0f, 38f);
+            const int levels = 9;
+            const float step = 3f;
+            Vector3[] prev = null;
+            for (int k = 0; k <= levels; k++)
+            {
+                float r = 0.95f - 0.05f * k;
+                var ring = new Vector3[3];
+                for (int i = 0; i < 3; i++)
+                {
+                    float ang = i * 120f * Mathf.Deg2Rad;
+                    ring[i] = m + new Vector3(Mathf.Cos(ang) * r, k * step, Mathf.Sin(ang) * r);
+                }
+                for (int i = 0; i < 3; i++)
+                    Strut("Kafes Yatay", t, ring[i], ring[(i + 1) % 3], 0.07f, rust);
+                if (prev != null)
+                    for (int i = 0; i < 3; i++)
+                    {
+                        Strut("Kafes Bacak", t, prev[i], ring[i], 0.1f, rust);
+                        Strut("Kafes Çapraz", t, prev[i], ring[(i + 1) % 3], 0.05f, rust);
+                    }
+                prev = ring;
+            }
+            // Direğin tabanına tek çarpıştırıcı, tepeye anten ve ikaz ışığı
+            Box("Direk Tabanı", t, m + new Vector3(0f, 0.4f, 0f), new Vector3(2.4f, 0.8f, 2.4f), Mat("Beton", new Color(0.2f, 0.2f, 0.21f)));
+            float topY = levels * step;
+            Cylinder("Anten", t, m + new Vector3(0f, topY + 1.5f, 0f), new Vector3(0.08f, 1.5f, 0.08f), metal, false);
+            MakeBlinker("Direk İkaz Işığı", t, m + new Vector3(0f, topY + 3.2f, 0f), red);
+        }
+
+        // Kırmızı küçük küre + nokta ışık; BlinkLight 1 sn periyot
+        static void MakeBlinker(string name, Transform parent, Vector3 pos, Material mat)
+        {
+            var go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            go.name = name;
+            Object.DestroyImmediate(go.GetComponent<Collider>());
             go.transform.SetParent(parent, false);
-            go.transform.localPosition = localPos;
+            go.transform.localPosition = pos;
+            go.transform.localScale = Vector3.one * 0.25f;
+            var rend = go.GetComponent<Renderer>();
+            rend.sharedMaterial = mat;
+            rend.shadowCastingMode = ShadowCastingMode.Off;
+
             var l = go.AddComponent<Light>();
             l.type = LightType.Point;
-            l.range = 7f;
-            l.intensity = 1.2f;
-            l.color = new Color(1f, 0.8f, 0.55f);
-            l.shadows = LightShadows.Soft;
-            go.AddComponent<LightFlicker>();
+            l.color = new Color(1f, 0.1f, 0.08f);
+            l.intensity = 3f;
+            l.range = 10f;
+            l.shadows = LightShadows.None;
+
+            var blink = go.AddComponent<BlinkLight>();
+            blink.period = 1f;
+            blink.lens = rend;
         }
 
-        static void Loot(string name, int value, float weight, PrimitiveType shape, Color color, Vector3 scale,
-            Transform parent, Vector3 localPos)
+        // ---------- Sodyum lamba direkleri ----------
+
+        static void BuildLampPosts()
         {
-            var go = GameObject.CreatePrimitive(shape);
-            go.name = name;
+            var root = new GameObject("Lamba Direkleri");
+            var pole = Mat("Direk Metal", new Color(0.15f, 0.15f, 0.16f));
+            var sodium = EmissiveMat("Sodyum", new Color(0.9f, 0.5f, 0.2f), new Color(3f, 1.6f, 0.5f));
+
+            // Araç çevresi (gölgesiz) ve giriş (yalnızca bu ikisi gölgeli)
+            LampPost(root.transform, new Vector3(-6f, 0f, -4f), pole, sodium, false, false);
+            LampPost(root.transform, new Vector3(7f, 0f, -12f), pole, sodium, false, false);
+            LampPost(root.transform, new Vector3(-5.5f, 0f, 3f), pole, sodium, false, true); // titreyen
+            LampPost(root.transform, new Vector3(5.5f, 0f, 3f), pole, sodium, false, false);
+            LampPost(root.transform, new Vector3(-6f, 0f, 8f), pole, sodium, true, false);
+            LampPost(root.transform, new Vector3(6f, 0f, 8f), pole, sodium, true, false);
+        }
+
+        static void LampPost(Transform parent, Vector3 pos, Material poleMat, Material bulbMat, bool shadows, bool flicker)
+        {
+            var go = new GameObject("Lamba Direği");
             go.transform.SetParent(parent, false);
-            go.transform.localPosition = localPos;
-            go.transform.localScale = scale;
-            go.GetComponent<Renderer>().sharedMaterial = Mat("Ganimet " + name, color);
+            go.transform.position = pos;
+            var t = go.transform;
+
+            Cylinder("Direk", t, new Vector3(0f, 2.5f, 0f), new Vector3(0.12f, 2.5f, 0.12f), poleMat, true);
+            Deco("Kol", t, new Vector3(0.4f, 5.0f, 0f), new Vector3(0.9f, 0.08f, 0.08f), poleMat);
+            Deco("Başlık", t, new Vector3(0.85f, 4.95f, 0f), new Vector3(0.55f, 0.12f, 0.32f), poleMat);
+            Deco("Ampul", t, new Vector3(0.85f, 4.87f, 0f), new Vector3(0.4f, 0.05f, 0.22f), bulbMat);
+
+            var lightGo = new GameObject("Sodyum Işığı");
+            lightGo.transform.SetParent(t, false);
+            lightGo.transform.localPosition = new Vector3(0.85f, 4.6f, 0f);
+            var l = lightGo.AddComponent<Light>();
+            l.type = LightType.Point;
+            l.color = new Color(1f, 0.65f, 0.3f);
+            l.intensity = 3f;
+            l.range = 14f;
+            l.shadows = shadows ? LightShadows.Soft : LightShadows.None;
+            if (flicker) lightGo.AddComponent<LightFlicker>();
+        }
+
+        // ---------- Tesis iç mekân üreticisi (ağ nesnesi) ----------
+
+        static void BuildFacilityGenerator(LootTable table)
+        {
+            var go = new GameObject("Tesis Üreteci");
+            go.transform.position = new Vector3(0f, -100f, 0f); // haritanın çok altı
+            go.AddComponent<NetworkObject>(); // sahnede yerleşik; kimlikleri RefreshNetworkObjectIds verir
+            var gen = go.AddComponent<FacilityGenerator>();
+            gen.lootTable = table;
+            gen.outsideExitPoint = new Vector3(0f, 0.05f, 7.5f);
+            gen.outsideExitYaw = 180f;
+
+            gen.concrete = Mat("Tesis Beton", new Color(0.16f, 0.16f, 0.17f));
+            gen.wallMat = Mat("Tesis Pas Duvar", new Color(0.27f, 0.22f, 0.18f));
+            gen.ceilingMat = Mat("Tesis Tavan", new Color(0.1f, 0.1f, 0.11f));
+            gen.lineMat = Mat("Sarı Çizgi", new Color(0.85f, 0.68f, 0.08f));
+            gen.metalMat = Mat("Tesis Metal", new Color(0.24f, 0.26f, 0.27f));
+            gen.crateMat = Mat("Tesis Sandık", new Color(0.33f, 0.24f, 0.13f));
+            gen.deskMat = Mat("Tesis Ahşap", new Color(0.22f, 0.2f, 0.18f));
+            gen.doorFrameMat = Mat("Tesis Çerçeve", new Color(0.08f, 0.08f, 0.09f));
+            gen.doorMat = Mat("Tesis Çıkış Kapısı", new Color(0.14f, 0.22f, 0.18f));
+            gen.pipeMat = Mat("Tesis Boru", new Color(0.22f, 0.18f, 0.16f));
+            gen.screenMat = EmissiveMat("Tesis Ekran", new Color(0.03f, 0.1f, 0.08f), new Color(0.3f, 1.6f, 1.1f));
+            gen.stripOnMat = EmissiveMat("Tesis Floresan Açık", new Color(0.8f, 0.9f, 1f), new Color(2f, 2.2f, 2.4f));
+            gen.stripOffMat = Mat("Tesis Floresan Kapalı", new Color(0.08f, 0.08f, 0.09f));
+            gen.ledGreenMat = EmissiveMat("Tesis LED Yeşil", new Color(0.05f, 0.3f, 0.05f), new Color(0.2f, 2f, 0.3f));
+            gen.ledRedMat = EmissiveMat("Tesis LED Kırmızı", new Color(0.3f, 0.05f, 0.05f), new Color(2f, 0.2f, 0.15f));
+            gen.exitSignMat = EmissiveMat("Tesis Çıkış Levhası", new Color(0.05f, 0.3f, 0.1f), new Color(0.2f, 2f, 0.5f));
+        }
+
+        static void BuildAtmosphere()
+        {
+            var go = new GameObject("Atmosfer");
+            go.AddComponent<AtmosphereController>();
+        }
+
+        // ---------- Ganimet prefabları ----------
+
+        sealed class ItemDef
+        {
+            public string name;
+            public int value;
+            public float weight;
+            public PrimitiveType shape;
+            public Color color;
+            public Vector3 scale;
+            public float spawnWeight;
+
+            public ItemDef(string name, int value, float weight, PrimitiveType shape, Color color, Vector3 scale, float spawnWeight)
+            {
+                this.name = name; this.value = value; this.weight = weight; this.shape = shape;
+                this.color = color; this.scale = scale; this.spawnWeight = spawnWeight;
+            }
+
+            /// <summary>Şeklin dünya boyutu (silindir ilkeli 2 birim yüksekliğindedir).</summary>
+            public Vector3 Dimensions =>
+                shape == PrimitiveType.Cylinder || shape == PrimitiveType.Capsule
+                    ? new Vector3(scale.x, scale.y * 2f, scale.z)
+                    : scale;
+        }
+
+        static ItemDef[] ItemDefs() => new[]
+        {
+            new ItemDef("Eski Saat", 25, 1f, PrimitiveType.Cylinder, new Color(0.8f, 0.7f, 0.3f), new Vector3(0.3f, 0.05f, 0.3f), 8f),
+            new ItemDef("Bakır Boru", 15, 6f, PrimitiveType.Cylinder, new Color(0.75f, 0.4f, 0.2f), new Vector3(0.12f, 0.6f, 0.12f), 8f),
+            new ItemDef("Kırık Radyo", 40, 8f, PrimitiveType.Cube, new Color(0.3f, 0.25f, 0.2f), new Vector3(0.5f, 0.3f, 0.25f), 5f),
+            new ItemDef("Oyuncak Ayı", 12, 1f, PrimitiveType.Sphere, new Color(0.6f, 0.4f, 0.25f), new Vector3(0.35f, 0.35f, 0.35f), 8f),
+            new ItemDef("Altın Kupa", 80, 5f, PrimitiveType.Cylinder, new Color(1f, 0.8f, 0.1f), new Vector3(0.3f, 0.25f, 0.3f), 2f),
+            new ItemDef("Teneke Kutu", 5, 1f, PrimitiveType.Cylinder, new Color(0.6f, 0.6f, 0.6f), new Vector3(0.15f, 0.12f, 0.15f), 12f),
+            new ItemDef("Fotoğraf Makinesi", 55, 2f, PrimitiveType.Cube, new Color(0.1f, 0.1f, 0.1f), new Vector3(0.3f, 0.2f, 0.15f), 4f),
+            new ItemDef("Akü", 30, 15f, PrimitiveType.Cube, new Color(0.15f, 0.3f, 0.15f), new Vector3(0.45f, 0.35f, 0.3f), 4f),
+            new ItemDef("Gümüş Tabak", 35, 2f, PrimitiveType.Cylinder, new Color(0.85f, 0.85f, 0.9f), new Vector3(0.4f, 0.02f, 0.4f), 5f),
+            new ItemDef("Eski Telefon", 20, 1f, PrimitiveType.Cube, new Color(0.5f, 0.1f, 0.1f), new Vector3(0.12f, 0.06f, 0.25f), 8f),
+            // Radyo istasyonu temalı
+            new ItemDef("Radyo Lambası", 45, 1f, PrimitiveType.Cylinder, new Color(0.75f, 0.85f, 0.9f), new Vector3(0.09f, 0.12f, 0.09f), 6f),
+            new ItemDef("Kaset", 10, 1f, PrimitiveType.Cube, new Color(0.12f, 0.1f, 0.1f), new Vector3(0.2f, 0.03f, 0.12f), 10f),
+            new ItemDef("Bant Makarası", 18, 2f, PrimitiveType.Cylinder, new Color(0.2f, 0.2f, 0.22f), new Vector3(0.3f, 0.03f, 0.3f), 7f),
+            new ItemDef("Kulaklık", 22, 1f, PrimitiveType.Cube, new Color(0.1f, 0.1f, 0.12f), new Vector3(0.22f, 0.1f, 0.2f), 7f),
+            new ItemDef("Mikrofon", 35, 2f, PrimitiveType.Cylinder, new Color(0.7f, 0.7f, 0.75f), new Vector3(0.07f, 0.13f, 0.07f), 5f),
+            new ItemDef("Frekans Kadranı", 28, 3f, PrimitiveType.Cylinder, new Color(0.6f, 0.5f, 0.3f), new Vector3(0.24f, 0.04f, 0.24f), 6f),
+            new ItemDef("Devre Kartı", 15, 1f, PrimitiveType.Cube, new Color(0.1f, 0.4f, 0.15f), new Vector3(0.28f, 0.02f, 0.2f), 9f),
+            new ItemDef("Osiloskop", 90, 12f, PrimitiveType.Cube, new Color(0.2f, 0.3f, 0.25f), new Vector3(0.5f, 0.35f, 0.4f), 2f),
+        };
+
+        static List<GameObject> BuildItemPrefabs(out LootTable table)
+        {
+            var defs = ItemDefs();
+            var prefabs = new List<GameObject>();
+            var entries = new List<LootTable.Entry>();
+            foreach (var d in defs)
+            {
+                var prefab = BuildItemPrefab(d);
+                prefabs.Add(prefab);
+                entries.Add(new LootTable.Entry { prefab = prefab, weight = d.spawnWeight });
+            }
+
+            table = AssetDatabase.LoadAssetAtPath<LootTable>(LootTablePath);
+            if (table == null)
+            {
+                table = ScriptableObject.CreateInstance<LootTable>();
+                AssetDatabase.CreateAsset(table, LootTablePath);
+            }
+            table.entries = entries.ToArray();
+            EditorUtility.SetDirty(table);
+            AssetDatabase.SaveAssets();
+            return prefabs;
+        }
+
+        static GameObject BuildItemPrefab(ItemDef d)
+        {
+            string slug = Slug(d.name);
+            var root = new GameObject(d.name);
+            Vector3 dims = d.Dimensions;
+            Vector3 colliderSize = dims;
+
+            // Gerçek model varsa ilkel şeklin yerine geçer
+            var modelAsset = FindModel(slug);
+            bool swapped = false;
+            if (modelAsset != null)
+            {
+                var inst = (GameObject)PrefabUtility.InstantiatePrefab(modelAsset);
+                inst.name = "Model";
+                inst.transform.SetParent(root.transform, false);
+                var rends = inst.GetComponentsInChildren<Renderer>();
+                if (rends.Length > 0)
+                {
+                    Bounds b = rends[0].bounds;
+                    for (int i = 1; i < rends.Length; i++) b.Encapsulate(rends[i].bounds);
+                    float maxModel = Mathf.Max(b.size.x, Mathf.Max(b.size.y, b.size.z));
+                    if (maxModel > 1e-5f)
+                    {
+                        float k = Mathf.Max(dims.x, Mathf.Max(dims.y, dims.z)) / maxModel;
+                        inst.transform.localScale = Vector3.one * k;
+                        inst.transform.localPosition = -b.center * k; // sınır merkezi köke otursun
+                        colliderSize = b.size * k;
+                        swapped = true;
+                    }
+                }
+                if (!swapped) Object.DestroyImmediate(inst);
+            }
+            Debug.Log("[Model] " + slug + (swapped ? " bulundu" : " yok (ilkel şekil)"));
+
+            if (!swapped)
+            {
+                var vis = GameObject.CreatePrimitive(d.shape);
+                vis.name = "Görsel";
+                Object.DestroyImmediate(vis.GetComponent<Collider>());
+                vis.transform.SetParent(root.transform, false);
+                vis.transform.localScale = d.scale;
+                vis.GetComponent<Renderer>().sharedMaterial = Mat("Ganimet " + d.name, d.color);
+            }
 
             // Küre/kapsül collider yerine kutu (yuvarlanmasın)
-            Object.DestroyImmediate(go.GetComponent<Collider>());
-            go.AddComponent<BoxCollider>();
-            IgnoreNavMesh(go);
+            var box = root.AddComponent<BoxCollider>();
+            box.size = colliderSize;
+            box.center = Vector3.zero;
+            IgnoreNavMesh(root);
 
             // Eşya durumunu sunucu tutar; reparent yok
-            var no = go.AddComponent<NetworkObject>();
+            var no = root.AddComponent<NetworkObject>();
             no.AutoObjectParentSync = false;
 
-            var item = go.AddComponent<Item>();
-            item.displayName = name;
-            item.value = value;
-            item.weight = weight;
+            var item = root.AddComponent<Item>();
+            item.displayName = d.name;
+            item.value = d.value;
+            item.weight = d.weight;
+
+            var swap = root.AddComponent<ModelSwap>();
+            swap.modelName = slug;
+            swap.hasModel = swapped;
+
+            var prefab = PrefabUtility.SaveAsPrefabAsset(root, ItemPrefabDir + "/" + slug + ".prefab");
+            Object.DestroyImmediate(root);
+            return prefab;
+        }
+
+        // Assets/ThirdParty/Models/**/{slug}.fbx (tam dosya adı eşleşmesi)
+        static GameObject FindModel(string slug)
+        {
+            if (!AssetDatabase.IsValidFolder(ModelsRoot)) return null;
+            foreach (var guid in AssetDatabase.FindAssets(slug + " t:Model", new[] { ModelsRoot }))
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guid);
+                if (!path.EndsWith(".fbx", System.StringComparison.OrdinalIgnoreCase)) continue;
+                if (!string.Equals(Path.GetFileNameWithoutExtension(path), slug, System.StringComparison.OrdinalIgnoreCase)) continue;
+                var go = AssetDatabase.LoadAssetAtPath<GameObject>(path);
+                if (go != null) return go;
+            }
+            return null;
+        }
+
+        /// <summary>Türkçe ad → ASCII snake_case ("Radyo Lambası" → "radyo_lambasi").</summary>
+        static string Slug(string name)
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (char ch in name)
+            {
+                char c = ch;
+                switch (c)
+                {
+                    case 'ç': case 'Ç': c = 'c'; break;
+                    case 'ğ': case 'Ğ': c = 'g'; break;
+                    case 'ı': case 'İ': case 'I': c = 'i'; break;
+                    case 'ö': case 'Ö': c = 'o'; break;
+                    case 'ş': case 'Ş': c = 's'; break;
+                    case 'ü': case 'Ü': c = 'u'; break;
+                    case ' ': c = '_'; break;
+                }
+                c = char.ToLowerInvariant(c);
+                if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') sb.Append(c);
+            }
+            return sb.ToString();
         }
 
         // ---------- Ağ ----------
 
-        static void BuildNetwork(GameObject playerPrefab, GameObject mimicPrefab)
+        static void BuildNetwork(GameObject playerPrefab, GameObject mimicPrefab, List<GameObject> itemPrefabs)
         {
             var go = new GameObject("NetworkManager");
             var nm = go.AddComponent<NetworkManager>();
@@ -258,6 +672,9 @@ namespace MimicGame.EditorTools
                 list.Add(new NetworkPrefab { Prefab = playerPrefab });
             if (!list.Contains(mimicPrefab))
                 list.Add(new NetworkPrefab { Prefab = mimicPrefab });
+            foreach (var ip in itemPrefabs)
+                if (ip != null && !list.Contains(ip))
+                    list.Add(new NetworkPrefab { Prefab = ip });
             EditorUtility.SetDirty(list);
             AssetDatabase.SaveAssets();
             if (!nm.NetworkConfig.Prefabs.NetworkPrefabsLists.Contains(list))
@@ -273,8 +690,9 @@ namespace MimicGame.EditorTools
             go.transform.position = new Vector3(8f, 6f, -14f);
             go.transform.LookAt(new Vector3(0f, 1f, 10f));
             var cam = go.AddComponent<Camera>();
-            cam.clearFlags = CameraClearFlags.SolidColor;
+            cam.clearFlags = CameraClearFlags.Skybox;
             cam.backgroundColor = Color.black;
+            EnablePostProcessing(cam);
             go.AddComponent<AudioListener>();
             go.AddComponent<MenuCamera>();
         }
@@ -322,8 +740,9 @@ namespace MimicGame.EditorTools
             var cam = camGo.AddComponent<Camera>();
             cam.nearClipPlane = 0.05f;
             cam.fieldOfView = 70f;
-            cam.clearFlags = CameraClearFlags.SolidColor;
+            cam.clearFlags = CameraClearFlags.Skybox;
             cam.backgroundColor = Color.black;
+            EnablePostProcessing(cam);
             var listener = camGo.AddComponent<AudioListener>();
             camGo.tag = "MainCamera";
 
@@ -477,25 +896,11 @@ namespace MimicGame.EditorTools
 
         static void BuildMimicDirector(GameObject mimicPrefab)
         {
-            var building = GameObject.Find("Bina");
             var go = new GameObject("Taklitçi Yöneticisi");
             var director = go.AddComponent<MimicDirector>();
             director.mimicPrefab = mimicPrefab;
-
-            var local = new[]
-            {
-                new Vector3(-6f, 0f, 6f), new Vector3(6f, 0f, 6f),
-                new Vector3(-6f, 0f, -6f), new Vector3(6f, 0f, -4f),
-            };
-            var points = new Transform[local.Length];
-            for (int i = 0; i < local.Length; i++)
-            {
-                var sp = new GameObject("Taklitçi Doğma Noktası " + (i + 1));
-                sp.transform.SetParent(building != null ? building.transform : go.transform, false);
-                sp.transform.localPosition = local[i];
-                points[i] = sp.transform;
-            }
-            director.spawnPoints = points;
+            // Doğma noktaları çalışma anında FacilityGenerator'dan gelir
+            director.spawnPoints = new Transform[0];
         }
 
         static void IgnoreNavMesh(GameObject go)
@@ -518,6 +923,54 @@ namespace MimicGame.EditorTools
             return go;
         }
 
+        // Çarpıştırıcısız süs kutusu
+        static GameObject Deco(string name, Transform parent, Vector3 localPos, Vector3 size, Material mat)
+        {
+            var go = Box(name, parent, localPos, size, mat);
+            Object.DestroyImmediate(go.GetComponent<Collider>());
+            return go;
+        }
+
+        static GameObject Cylinder(string name, Transform parent, Vector3 localPos, Vector3 scale, Material mat, bool collider)
+        {
+            var go = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+            go.name = name;
+            go.transform.SetParent(parent, false);
+            go.transform.localPosition = localPos;
+            go.transform.localScale = scale; // silindir ilkeli: 1 çap, 2 yükseklik
+            go.GetComponent<Renderer>().sharedMaterial = mat;
+            if (!collider) Object.DestroyImmediate(go.GetComponent<Collider>());
+            go.isStatic = true;
+            return go;
+        }
+
+        // İki yerel nokta arasında ince kiriş (kafes yapılar için), çarpıştırıcısız
+        static GameObject Strut(string name, Transform parent, Vector3 a, Vector3 b, float thickness, Material mat)
+        {
+            Vector3 d = b - a;
+            float len = d.magnitude;
+            var go = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            go.name = name;
+            Object.DestroyImmediate(go.GetComponent<Collider>());
+            go.transform.SetParent(parent, false);
+            go.transform.localPosition = (a + b) * 0.5f;
+            if (len > 1e-4f) go.transform.localRotation = Quaternion.FromToRotation(Vector3.forward, d / len);
+            go.transform.localScale = new Vector3(thickness, thickness, Mathf.Max(len, 0.001f));
+            go.GetComponent<Renderer>().sharedMaterial = mat;
+            go.isStatic = true;
+            return go;
+        }
+
+        static Material EmissiveMat(string name, Color color, Color emission)
+        {
+            var mat = Mat(name, color);
+            mat.EnableKeyword("_EMISSION");
+            mat.globalIlluminationFlags = MaterialGlobalIlluminationFlags.RealtimeEmissive;
+            if (mat.HasProperty("_EmissionColor")) mat.SetColor("_EmissionColor", emission);
+            EditorUtility.SetDirty(mat);
+            return mat;
+        }
+
         static Material Mat(string name, Color color)
         {
             string safe = name.Replace(' ', '_');
@@ -531,6 +984,7 @@ namespace MimicGame.EditorTools
             }
             if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", color);
             else mat.color = color;
+            if (mat.HasProperty("_Smoothness")) mat.SetFloat("_Smoothness", 0.2f); // mat, taş/pas görünümü
             EditorUtility.SetDirty(mat);
             return mat;
         }

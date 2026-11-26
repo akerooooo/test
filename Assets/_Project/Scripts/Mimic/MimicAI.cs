@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using MimicGame.Items;
+using MimicGame.Level;
 using MimicGame.Network;
 using MimicGame.Player;
 using MimicGame.Voice;
@@ -410,6 +411,7 @@ namespace MimicGame.Mimic
             {
                 var p = all[i];
                 if (p == null || !p.IsSpawned || p.IsDead) continue;
+                if (p.IsInside != SelfInside) continue; // farklı bölgedekiler görmez
                 if (Vector3.Distance(p.transform.position, transform.position) > SeenRange) continue;
                 if (HasLineOfSight(Head(p), chest)) { seenCache = true; break; }
             }
@@ -563,7 +565,8 @@ namespace MimicGame.Mimic
             tmpPlayers.Clear();
             var all = PlayerNetwork.All;
             for (int i = 0; i < all.Count; i++)
-                if (all[i] != null && all[i].IsSpawned && !all[i].IsDead) tmpPlayers.Add(all[i]);
+                if (all[i] != null && all[i].IsSpawned && !all[i].IsDead && all[i].IsInside == SelfInside)
+                    tmpPlayers.Add(all[i]); // yalnızca aynı bölgedeki (içeri/dışarı) oyuncular hedef olur
         }
 
         public static Vector3 Head(PlayerNetwork p)
@@ -575,8 +578,11 @@ namespace MimicGame.Mimic
             return Vector3.Distance(a, b);
         }
 
+        // Taklitçi tesisin içinde mi (iç mekân haritanın çok altındadır)
+        bool SelfInside => FacilityGenerator.IsInteriorPoint(transform.position);
+
         bool InsideBuilding(Vector3 p)
-            => Mathf.Abs(p.x - buildingCenter.x) < buildingHalfSize.x - 0.5f &&
+            => FacilityGenerator.IsInteriorPoint(p) || Mathf.Abs(p.x - buildingCenter.x) < buildingHalfSize.x - 0.5f &&
                Mathf.Abs(p.z - buildingCenter.z) < buildingHalfSize.y - 0.5f;
 
         PlayerNetwork NearestPlayer()
@@ -703,6 +709,10 @@ namespace MimicGame.Mimic
                     if (p == null) continue;
                     Vector2 circ = Random.insideUnitCircle.normalized * Random.Range(10f, 16f);
                     c = p.transform.position + new Vector3(circ.x, 0f, circ.y);
+                }
+                else if (SelfInside && FacilityGenerator.TryGetRandomPoint(out var roomPoint))
+                {
+                    c = roomPoint; // tesis odalarından biri
                 }
                 else
                 {

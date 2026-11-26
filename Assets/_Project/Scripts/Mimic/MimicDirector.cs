@@ -1,4 +1,5 @@
 using System.Text;
+using MimicGame.Level;
 using MimicGame.Network;
 using MimicGame.Player;
 using MimicGame.Voice;
@@ -46,7 +47,8 @@ namespace MimicGame.Mimic
             wasServer = server;
             if (!server) return;
 
-            if (!spawnedInitial && Time.time - serverStart >= firstSpawnSeconds)
+            // Tesis üretilmeden taklitçi doğmaz (doğma noktaları oradan gelir)
+            if (!spawnedInitial && Time.time - serverStart >= firstSpawnSeconds && FacilityReady())
             {
                 spawnedInitial = true;
                 for (int i = 0; i < mimicCount; i++) SpawnMimic();
@@ -68,6 +70,8 @@ namespace MimicGame.Mimic
         }
 
         // Herkes 6 sn ölü kalırsa: herkesi araç yanında canlandır, taklitçileri sıfırla (geçici tur döngüsü)
+        static bool FacilityReady() => FacilityGenerator.Instance == null || FacilityGenerator.Generated;
+
         void UpdateRoundReset()
         {
             if (PlayerHealth.All.Count >= 1 && PlayerHealth.AliveCount == 0)
@@ -115,7 +119,7 @@ namespace MimicGame.Mimic
         public void SpawnMimic()
         {
             if (mimicPrefab == null) { Debug.LogWarning("[Taklitçi] Prefab atanmamış."); return; }
-            Vector3 pos = ChooseSpawnPosition();
+            if (!TryChooseSpawnPosition(out Vector3 pos)) { Debug.LogWarning("[Taklitçi] Doğma noktası yok."); return; }
             if (NavMesh.SamplePosition(pos, out var hit, 4f, NavMesh.AllAreas)) pos = hit.position;
             else Debug.LogWarning("[Taklitçi] Doğma noktası NavMesh üzerinde değil: " + pos);
 
@@ -128,51 +132,59 @@ namespace MimicGame.Mimic
             Debug.Log("[Taklitçi] Doğdu: konum " + pos + ", kimlik " + (ai != null ? ai.TargetClientId.ToString() : "?"));
         }
 
-        // Oyuncuların ortalamasına en yakın, hepsinden >= 12 m uzak ve kimsenin görüş hattında olmayan nokta
-        Vector3 ChooseSpawnPosition()
+        // Oyuncuların ortalamasına en yakın, hepsinden >= MinSpawnDistance uzak ve kimsenin görüş hattında olmayan nokta.
+        // Tesis üretildiyse noktalar oradan (iç mekân), yoksa sahnedeki doğma noktalarından gelir.
+        bool TryChooseSpawnPosition(out Vector3 result)
         {
-            if (spawnPoints == null || spawnPoints.Length == 0) return transform.position;
+            result = transform.position;
+            var candidates = new System.Collections.Generic.List<Vector3>();
+            if (FacilityGenerator.Generated && FacilityGenerator.MimicSpawns.Count > 0)
+                candidates.AddRange(FacilityGenerator.MimicSpawns);
+            else if (spawnPoints != null)
+                foreach (var sp in spawnPoints)
+                    if (sp != null) candidates.Add(sp.position);
+            if (candidates.Count == 0) return false;
 
+            // Yalnızca doğma bölgesiyle (içeri/dışarı) aynı bölgedeki oyuncular hesaba katılır
+            bool interior = FacilityGenerator.IsInteriorPoint(candidates[0]);
             var players = PlayerNetwork.All;
             Vector3 avg = Vector3.zero;
             int pc = 0;
             for (int i = 0; i < players.Count; i++)
             {
-                if (players[i] == null || !players[i].IsSpawned || players[i].IsDead) continue;
+                if (players[i] == null || !players[i].IsSpawned || players[i].IsDead || players[i].IsInside != interior) continue;
                 avg += players[i].transform.position;
                 pc++;
             }
             if (pc > 0) avg /= pc;
 
-            Transform best = null;
+            bool found = false;
+            Vector3 best = candidates[0];
             float bestD = float.MaxValue;
-            for (int i = 0; i < spawnPoints.Length; i++)
+            for (int i = 0; i < candidates.Count; i++)
             {
-                var sp = spawnPoints[i];
-                if (sp == null) continue;
-                Vector3 p = sp.position;
+                Vector3 p = candidates[i];
                 bool ok = true;
                 for (int j = 0; j < players.Count && ok; j++)
                 {
                     var pl = players[j];
-                    if (pl == null || !pl.IsSpawned || pl.IsDead) continue;
+                    if (pl == null || !pl.IsSpawned || pl.IsDead || pl.IsInside != interior) continue;
                     if (Vector3.Distance(pl.transform.position, p) < MinSpawnDistance) ok = false;
                     else if (MimicAI.HasLineOfSight(MimicAI.Head(pl), p + Vector3.up * 1.2f)) ok = false;
                 }
                 if (!ok) continue;
-                float d = pc > 0 ? Vector3.Distance(avg, p) : 0f;
-                if (d < bestD) { bestD = d; best = sp; }
+                float d = pc > 0 ? Vector3.Distance(avg, p) : Random.value; // oyuncu yoksa rastgele
+                if (d < bestD) { bestD = d; best = p; found = true; }
             }
 
-            if (best == null)
+            if (!found)
             {
-                // Uygun nokta yok: herhangi biri
-                for (int tries = 0; tries < 8 && best == null; tries++)
-                    best = spawnPoints[Random.Range(0, spawnPoints.Length)];
-                if (best == null) return transform.position;
+                // Uygun nokta yok: rastgele biri
+                best = candidates[Random.Range(0, candidates.Count)];
                 Debug.Log("[Taklitçi] Uzak ve görünmeyen doğma noktası yok; rastgele seçildi.");
             }
-            return best.position;
+            result = best;
+            return true;
         }
 
         void OnGUI()

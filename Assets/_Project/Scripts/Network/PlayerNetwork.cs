@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using MimicGame.Items;
+using MimicGame.Level;
 using MimicGame.Mimic;
 using MimicGame.Player;
 using MimicGame.UI;
@@ -37,12 +38,18 @@ namespace MimicGame.Network
         readonly NetworkVariable<bool> crouching = new NetworkVariable<bool>(false,
             NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Owner);
 
+        // Tesisin içinde mi (sahip yazar; ışınlanınca ve her karede yüksekliğe göre güncellenir)
+        readonly NetworkVariable<bool> isInside = new NetworkVariable<bool>(false,
+            NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Owner);
+
         readonly NetworkVariable<int> colorIndex = new NetworkVariable<int>(0,
             NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
 
         /// <summary>Sunucudaki/uzak oyuncuda senkron eğilme durumu.</summary>
         public bool IsCrouchingNet => crouching.Value;
         public int ColorIndex => colorIndex.Value;
+        /// <summary>Oyuncu tesisin içinde mi (iç mekân haritanın altındadır).</summary>
+        public bool IsInside => isInside.Value;
         public Color BodyColor => PlayerAppearance.GetColor(colorIndex.Value);
 
         PlayerMotor motor;
@@ -137,13 +144,28 @@ namespace MimicGame.Network
         }
 
         /// <summary>Sahip: oyuncuyu ışınlar (kontrolcü kapatılıp açılır) ve ağ kopyalarına anında bildirir.</summary>
-        public void OwnerTeleport(Vector3 pos)
+        public void OwnerTeleport(Vector3 pos) => DoTeleport(pos, null);
+
+        /// <summary>Sahip: oyuncuyu verilen konuma ve yatay yöne (yaw, derece) ışınlar.</summary>
+        public void OwnerTeleport(Vector3 pos, float yaw) => DoTeleport(pos, yaw);
+
+        void DoTeleport(Vector3 pos, float? yaw)
         {
             if (Controller != null) Controller.enabled = false;
             transform.position = pos;
+            if (yaw.HasValue) transform.rotation = Quaternion.Euler(0f, yaw.Value, 0f);
             // Ölüyken kontrolcü kapalı kalır (PlayerHealth açar)
             if (Controller != null) Controller.enabled = !IsDead;
             pendingTeleport = true; // ağdaki kopyalar kaymadan zıplasın
+            SyncInside(pos);
+        }
+
+        // İç mekân durumunu konumdan türetir (yalnızca sahip yazar)
+        void SyncInside(Vector3 pos)
+        {
+            if (!IsSpawned || !IsOwner) return;
+            bool inside = FacilityGenerator.IsInteriorPoint(pos);
+            if (isInside.Value != inside) isInside.Value = inside;
         }
 
         void OnColorChanged(int oldValue, int newValue) => PlayerAppearance.ApplyColor(bodyRenderer, newValue);
@@ -165,6 +187,7 @@ namespace MimicGame.Network
                     pendingTeleport = false;
                     netTransform.Teleport(transform.position, transform.rotation, transform.localScale);
                 }
+                SyncInside(transform.position);
                 float p = look != null ? look.Pitch : 0f;
                 if (Mathf.Abs(p - pitch.Value) > 0.5f) pitch.Value = p;
                 if (motor != null && crouching.Value != motor.IsCrouching) crouching.Value = motor.IsCrouching;
