@@ -56,7 +56,12 @@ namespace MimicGame.UI
             {
                 string prompt = interactor.Prompt;
                 if (!string.IsNullOrEmpty(prompt))
-                    Shadowed(new Rect(center.x - 400f * s, center.y + 24f * s, 800f * s, 40f * s), "[E] " + prompt, centerStyle);
+                    Shadowed(new Rect(center.x - 400f * s, center.y + 24f * s, 800f * s, 40f * s), (interactor.Target is MimicGame.Interaction.IHoldInteractable ? prompt : "[E] " + prompt), centerStyle);
+
+                // Basılı tutma ilerlemesi: nişangâhın altında küçük çubuk
+                if (interactor.Holding)
+                    Bar(new Rect(center.x - 60f * s, center.y + 70f * s, 120f * s, 8f * s),
+                        interactor.HoldProgress01, new Color(1f, 0.75f, 0.2f), white);
             }
 
             // Envanter
@@ -66,6 +71,7 @@ namespace MimicGame.UI
                 float total = PlayerInventory.SlotCount * size + (PlayerInventory.SlotCount - 1) * gap;
                 float x0 = (Screen.width - total) * 0.5f;
                 float y = Screen.height - size - 30f * s;
+                if (flashlight != null) DrawFlashlightSlot(new Rect(x0 - size - gap, y, size, size), s, white);
                 for (int i = 0; i < PlayerInventory.SlotCount; i++)
                 {
                     var r = new Rect(x0 + i * (size + gap), y, size, size);
@@ -86,11 +92,6 @@ namespace MimicGame.UI
                 Bar(new Rect(30f * s, Screen.height - 60f * s, 220f * s, 10f * s), motor.Stamina01,
                     motor.IsExhausted ? new Color(0.9f, 0.3f, 0.2f) : new Color(0.9f, 0.9f, 0.9f), white);
 
-            // Fener pili
-            if (!dead && flashlight != null && flashlight.IsOn)
-                Shadowed(new Rect(30f * s, Screen.height - 95f * s, 300f * s, 30f * s),
-                    $"Fener: %{flashlight.Battery01 * 100f:0}", labelStyle);
-
             if (dead) DrawSpectatorInfo(s, center);
 
             // Ganimet / kota
@@ -104,6 +105,30 @@ namespace MimicGame.UI
 
             if (Cursor.lockState != CursorLockMode.Locked)
                 Shadowed(new Rect(0f, center.y - 60f * s, Screen.width, 40f * s), "Devam etmek için tıkla", centerStyle);
+        }
+
+        // Envanterin solunda fener kutusu: ikon (açıkken parlak), pil çubuğu ve yüzde
+        void DrawFlashlightSlot(Rect r, float s, Texture2D white)
+        {
+            GUI.color = new Color(0f, 0f, 0f, 0.35f);
+            GUI.DrawTexture(r, white);
+            GUI.color = new Color(1f, 1f, 1f, 0.3f);
+            Border(r, 2f * s, white);
+
+            float b = Mathf.Clamp01(flashlight.Battery01);
+            Color fill = b > 0.5f ? new Color(0.3f, 0.85f, 0.3f)
+                : b >= 0.2f ? new Color(0.95f, 0.8f, 0.2f) : new Color(0.9f, 0.25f, 0.2f);
+
+            float a = flashlight.IsOn ? 1f : 0.45f;
+            var icon = new Rect(r.x + r.width * 0.2f, r.y + 6f * s, r.width * 0.6f, r.width * 0.6f);
+            GUI.color = new Color(1f, 0.95f, 0.75f, a);
+            GUI.DrawTexture(icon, FlashlightIcon.Icon);
+
+            var bar = new Rect(r.x + 8f * s, r.y + r.height * 0.62f, r.width - 16f * s, 7f * s);
+            Bar(bar, b, fill, white);
+
+            GUI.color = Color.white;
+            Shadowed(new Rect(r.x, r.y + r.height * 0.62f + 8f * s, r.width, 20f * s), $"%{b * 100f:0}", slotStyle);
         }
 
         // Ölüyken: gözlem bilgisi; herkes ölmüşse ortada bilgi yazısı

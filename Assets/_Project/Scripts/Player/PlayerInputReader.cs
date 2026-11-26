@@ -19,6 +19,7 @@ namespace MimicGame.Player
         public bool CrouchPressed => crouch.WasPressedThisFrame();
         public bool JumpPressed => jump.WasPressedThisFrame();
         public bool InteractPressed => interact.WasPressedThisFrame();
+        public bool InteractHeld => interact.IsPressed();
         public bool DropPressed => drop.WasPressedThisFrame();
         public bool FlashlightPressed => flashlight.WasPressedThisFrame();
         public bool UsePressed => use.WasPressedThisFrame();

@@ -231,6 +231,32 @@ namespace MimicGame.EditorTools
             box.isTrigger = true;
             box.size = new Vector3(2.8f, 2f, 4.8f);
             zone.AddComponent<LootZone>();
+
+            BuildChargingStation(t);
+        }
+
+        // Kasa içinde ön duvara dayalı fener şarj istasyonu
+        static void BuildChargingStation(Transform van)
+        {
+            var root = Box("Şarj İstasyonu", van, new Vector3(0f, 1.0f, -2.22f), new Vector3(1f, 1.4f, 0.4f),
+                Mat("Şarj Kabin", new Color(0.18f, 0.2f, 0.22f)));
+            Deco("Şarj Paneli", van, new Vector3(0f, 1.15f, -1.96f), new Vector3(0.7f, 0.3f, 0.05f),
+                EmissiveMat("Şarj Panel", new Color(0.1f, 0.3f, 0.35f), new Color(0.2f, 0.9f, 1f) * 1.2f));
+            var led = Deco("Durum Işığı", van, new Vector3(0f, 0.8f, -1.96f), new Vector3(0.2f, 0.12f, 0.05f),
+                EmissiveMat("Şarj Durum", Color.white, Color.white));
+
+            var glowGo = new GameObject("Durum Parıltısı");
+            glowGo.transform.SetParent(van, false);
+            glowGo.transform.localPosition = new Vector3(0f, 0.8f, -1.7f);
+            var glow = glowGo.AddComponent<Light>();
+            glow.type = LightType.Point;
+            glow.range = 2f;
+            glow.intensity = 0.6f;
+            glow.color = new Color(1f, 0.15f, 0.1f);
+
+            var st = root.AddComponent<ChargingStation>();
+            st.statusLight = led.GetComponent<Renderer>();
+            st.statusGlow = glow;
         }
 
         // ---------- Tesis cephesi (kapalı blok; iç mekân prosedürel ve haritanın altında) ----------
@@ -786,11 +812,11 @@ namespace MimicGame.EditorTools
             lightGo.transform.localPosition = new Vector3(0.2f, -0.15f, 0.1f);
             var spot = lightGo.AddComponent<Light>();
             spot.type = LightType.Spot;
-            spot.range = 25f;
-            spot.spotAngle = 55f;
-            spot.innerSpotAngle = 25f;
-            spot.intensity = 6f;
-            spot.color = new Color(1f, 0.95f, 0.85f);
+            spot.range = 30f;
+            spot.spotAngle = 62f;
+            spot.innerSpotAngle = 30f;
+            spot.intensity = 9f;
+            spot.color = new Color(1f, 0.96f, 0.88f);
             spot.shadows = LightShadows.Soft;
 
             // El (tutulan eşyanın durduğu yer)

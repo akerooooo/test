@@ -16,7 +16,12 @@ namespace MimicGame.Player
 
         public IInteractable Target { get; private set; }
         public PlayerInventory Inventory { get; private set; }
-        public string Prompt => Target?.GetPrompt(this);
+        public string Prompt => Target is IHoldInteractable h ? h.GetHoldPrompt(this) : Target?.GetPrompt(this);
+
+        /// <summary>Şu an basılı tutulan bir etkileşim sürüyor mu.</summary>
+        public bool Holding { get; private set; }
+        /// <summary>Basılı tutma ilerlemesi (0-1); HUD halkası için, hedef tarafından yazılır.</summary>
+        public float HoldProgress01 { get; set; }
 
         static readonly RaycastHit[] hitBuffer = new RaycastHit[16];
 
@@ -31,6 +36,7 @@ namespace MimicGame.Player
         void Update()
         {
             Target = null;
+            Holding = false;
             if (viewPoint == null) return;
 
             Vector3 origin = viewPoint.position;
@@ -88,7 +94,11 @@ namespace MimicGame.Player
             if (other != null && !(bestItem != null && bestAngle < 4f)) Target = other;
             else if (bestItem != null) Target = bestItem;
 
-            if (Target != null && input.InteractPressed)
+            if (Target is IHoldInteractable hold)
+            {
+                if (input.InteractHeld) Holding = hold.HoldUpdate(this, Time.deltaTime);
+            }
+            else if (Target != null && input.InteractPressed)
                 Target.Interact(this);
         }
 
