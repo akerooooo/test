@@ -546,6 +546,7 @@ namespace MimicGame.EditorTools
         static GameObject BuildItemPrefab(ItemDef d)
         {
             string slug = Slug(d.name);
+            if (ModelAliases.TryGetValue(slug, out var alias)) slug = alias;
             var root = new GameObject(d.name);
             Vector3 dims = d.Dimensions;
             Vector3 colliderSize = dims;
@@ -627,6 +628,14 @@ namespace MimicGame.EditorTools
         }
 
         /// <summary>Türkçe ad → ASCII snake_case ("Radyo Lambası" → "radyo_lambasi").</summary>
+        // Model paketindeki dosya adı eşyanın adından farklıysa
+        static readonly Dictionary<string, string> ModelAliases = new Dictionary<string, string>
+        {
+            { "fotograf_makinesi", "eski_fotograf_makinesi" },
+            { "aku", "araba_akusu" },
+            { "eski_telefon", "cevirmeli_telefon" },
+        };
+
         static string Slug(string name)
         {
             var sb = new System.Text.StringBuilder();
