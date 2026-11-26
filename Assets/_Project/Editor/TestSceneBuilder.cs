@@ -2,17 +2,20 @@ using System.IO;
 using MimicGame.Environment;
 using MimicGame.Game;
 using MimicGame.Items;
+using MimicGame.Mimic;
 using MimicGame.Network;
 using MimicGame.Player;
 using Netcode.Transports.Facepunch;
 using MimicGame.UI;
 using MimicGame.Voice;
+using Unity.AI.Navigation;
 using Unity.Netcode;
 using Unity.Netcode.Components;
 using Unity.Netcode.Transports.UTP;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
+using UnityEngine.AI;
 using UnityEngine.Rendering;
 using UnityEngine.SceneManagement;
 
@@ -30,6 +33,7 @@ namespace MimicGame.EditorTools
         const string MaterialDir = "Assets/_Project/Materials";
         const string PrefabDir = "Assets/_Project/Prefabs";
         const string PlayerPrefabPath = PrefabDir + "/Player.prefab";
+        const string MimicPrefabPath = PrefabDir + "/Mimic.prefab";
         const string NetworkPrefabsListPath = "Assets/DefaultNetworkPrefabs.asset";
 
         [MenuItem("MimicGame/Test Sahnesini Oluştur")]
@@ -53,7 +57,10 @@ namespace MimicGame.EditorTools
             BuildVan(new Vector3(0f, 0f, -8f));
             BuildFacility(new Vector3(0f, 0f, 20f));
             var playerPrefab = BuildPlayerPrefab();
-            BuildNetwork(playerPrefab);
+            var mimicPrefab = BuildMimicPrefab();
+            BuildNavMesh();
+            BuildMimicDirector(mimicPrefab);
+            BuildNetwork(playerPrefab, mimicPrefab);
             BuildMenuCamera();
 
             EditorSceneManager.SaveScene(scene, ScenePath);
@@ -141,7 +148,8 @@ namespace MimicGame.EditorTools
             const float h = 4f, half = 10f, th = 0.3f;
 
             Box("Bina Zemini", t, new Vector3(0f, 0.02f, 0f), new Vector3(2 * half, 0.04f, 2 * half), floor);
-            Box("Tavan", t, new Vector3(0f, h + th * 0.5f, 0f), new Vector3(2 * half, th, 2 * half), wall);
+            var ceiling = Box("Tavan", t, new Vector3(0f, h + th * 0.5f, 0f), new Vector3(2 * half, th, 2 * half), wall);
+            IgnoreNavMesh(ceiling); // tavanın üstü yürünebilir yüzey sayılmasın
             Box("Kuzey Duvarı", t, new Vector3(0f, h / 2, half), new Vector3(2 * half, h, th), wall);
             Box("Doğu Duvarı", t, new Vector3(half, h / 2, 0f), new Vector3(th, h, 2 * half), wall);
             Box("Batı Duvarı", t, new Vector3(-half, h / 2, 0f), new Vector3(th, h, 2 * half), wall);
@@ -167,6 +175,7 @@ namespace MimicGame.EditorTools
             var panel = Box("Kapı Paneli", hinge.transform, new Vector3(1f, 1.25f, 0f), new Vector3(1.95f, 2.5f, 0.08f),
                 Mat("Kapı", new Color(0.25f, 0.15f, 0.1f)));
             panel.isStatic = false;
+            IgnoreNavMesh(panel); // kapalı kapı NavMesh'te boşluğu tıkamasın
 
             // Titreyen lambalar
             Lamp(t, new Vector3(0f, 3.6f, 2f));
@@ -214,6 +223,7 @@ namespace MimicGame.EditorTools
             // Küre/kapsül collider yerine kutu (yuvarlanmasın)
             Object.DestroyImmediate(go.GetComponent<Collider>());
             go.AddComponent<BoxCollider>();
+            IgnoreNavMesh(go);
 
             // Eşya durumunu sunucu tutar; reparent yok
             var no = go.AddComponent<NetworkObject>();
@@ -227,7 +237,7 @@ namespace MimicGame.EditorTools
 
         // ---------- Ağ ----------
 
-        static void BuildNetwork(GameObject playerPrefab)
+        static void BuildNetwork(GameObject playerPrefab, GameObject mimicPrefab)
         {
             var go = new GameObject("NetworkManager");
             var nm = go.AddComponent<NetworkManager>();
@@ -246,6 +256,8 @@ namespace MimicGame.EditorTools
             }
             if (!list.Contains(playerPrefab))
                 list.Add(new NetworkPrefab { Prefab = playerPrefab });
+            if (!list.Contains(mimicPrefab))
+                list.Add(new NetworkPrefab { Prefab = mimicPrefab });
             EditorUtility.SetDirty(list);
             AssetDatabase.SaveAssets();
             if (!nm.NetworkConfig.Prefabs.NetworkPrefabsLists.Contains(list))
@@ -300,6 +312,7 @@ namespace MimicGame.EditorTools
             player.AddComponent<PlayerHUD>();
             var net = player.AddComponent<PlayerNetwork>();
             var voice = player.AddComponent<PlayerVoice>();
+            player.AddComponent<ClipSharing>();
 
             // Kamera
             var camGo = new GameObject("Kamera");
@@ -364,6 +377,125 @@ namespace MimicGame.EditorTools
             var prefab = PrefabUtility.SaveAsPrefabAsset(player, PlayerPrefabPath);
             Object.DestroyImmediate(player);
             return prefab;
+        }
+
+        // ---------- Taklitçi ----------
+
+        static GameObject BuildMimicPrefab()
+        {
+            var mimic = new GameObject("Taklitçi");
+            mimic.transform.position = Vector3.zero;
+
+            mimic.AddComponent<NetworkObject>();
+            var nt = mimic.AddComponent<NetworkTransform>();
+            nt.AuthorityMode = NetworkTransform.AuthorityModes.Server;
+            nt.SyncRotAngleX = false;
+            nt.SyncRotAngleZ = false;
+            nt.SyncScaleX = false;
+            nt.SyncScaleY = false;
+            nt.SyncScaleZ = false;
+            nt.Interpolate = true;
+
+            var agent = mimic.AddComponent<NavMeshAgent>();
+            agent.radius = 0.35f;
+            agent.height = 1.8f;
+            agent.speed = 3.5f;
+            agent.angularSpeed = 720f;
+            agent.acceleration = 20f;
+            agent.stoppingDistance = 1.2f;
+            agent.enabled = false; // yalnızca sunucuda MimicAI açar
+
+            var col = mimic.AddComponent<CapsuleCollider>();
+            col.height = 1.8f;
+            col.radius = 0.35f;
+            col.center = new Vector3(0f, 0.9f, 0f);
+
+            var ai = mimic.AddComponent<MimicAI>();
+
+            // Gövde: oyuncununkiyle aynı
+            var body = GameObject.CreatePrimitive(PrimitiveType.Capsule);
+            body.name = "Gövde";
+            body.transform.SetParent(mimic.transform, false);
+            body.transform.localPosition = new Vector3(0f, 0.9f, 0f);
+            body.transform.localScale = new Vector3(0.7f, 0.9f, 0.7f);
+            Object.DestroyImmediate(body.GetComponent<Collider>());
+            var bodyRenderer = body.GetComponent<Renderer>();
+            bodyRenderer.sharedMaterial = Mat("Oyuncu Gövde", new Color(0.25f, 0.4f, 0.6f));
+
+            // Kamera yerine sadece pivot
+            var pivot = new GameObject("Kamera");
+            pivot.transform.SetParent(mimic.transform, false);
+            pivot.transform.localPosition = new Vector3(0f, 1.65f, 0f);
+
+            var lightGo = new GameObject("El Feneri");
+            lightGo.transform.SetParent(pivot.transform, false);
+            lightGo.transform.localPosition = new Vector3(0.2f, -0.15f, 0.1f);
+            var spot = lightGo.AddComponent<Light>();
+            spot.type = LightType.Spot;
+            spot.range = 25f;
+            spot.spotAngle = 55f;
+            spot.innerSpotAngle = 25f;
+            spot.intensity = 6f;
+            spot.color = new Color(1f, 0.95f, 0.85f);
+            spot.shadows = LightShadows.Soft;
+            spot.enabled = false;
+
+            var sesGo = new GameObject("Ses");
+            sesGo.transform.SetParent(pivot.transform, false);
+            sesGo.transform.localPosition = new Vector3(0f, -0.1f, 0f);
+            var sesSource = sesGo.AddComponent<AudioSource>();
+            sesSource.playOnAwake = false;
+            sesGo.AddComponent<AudioLowPassFilter>();
+            var vp = sesGo.AddComponent<VoicePlayer>();
+
+            ai.body = body.transform;
+            ai.bodyRenderer = bodyRenderer;
+            ai.cameraPivot = pivot.transform;
+            ai.spot = spot;
+            ai.voicePlayer = vp;
+
+            var prefab = PrefabUtility.SaveAsPrefabAsset(mimic, MimicPrefabPath);
+            Object.DestroyImmediate(mimic);
+            return prefab;
+        }
+
+        static void BuildNavMesh()
+        {
+            var go = new GameObject("NavMesh");
+            var surface = go.AddComponent<NavMeshSurface>();
+            surface.collectObjects = CollectObjects.All;
+            surface.useGeometry = NavMeshCollectGeometry.PhysicsColliders;
+            var baker = go.AddComponent<RuntimeNavMeshBaker>();
+            baker.surface = surface;
+        }
+
+        static void BuildMimicDirector(GameObject mimicPrefab)
+        {
+            var building = GameObject.Find("Bina");
+            var go = new GameObject("Taklitçi Yöneticisi");
+            var director = go.AddComponent<MimicDirector>();
+            director.mimicPrefab = mimicPrefab;
+
+            var local = new[]
+            {
+                new Vector3(-6f, 0f, 6f), new Vector3(6f, 0f, 6f),
+                new Vector3(-6f, 0f, -6f), new Vector3(6f, 0f, -4f),
+            };
+            var points = new Transform[local.Length];
+            for (int i = 0; i < local.Length; i++)
+            {
+                var sp = new GameObject("Taklitçi Doğma Noktası " + (i + 1));
+                sp.transform.SetParent(building != null ? building.transform : go.transform, false);
+                sp.transform.localPosition = local[i];
+                points[i] = sp.transform;
+            }
+            director.spawnPoints = points;
+        }
+
+        static void IgnoreNavMesh(GameObject go)
+        {
+            var mod = go.AddComponent<NavMeshModifier>();
+            mod.ignoreFromBuild = true;
         }
 
         // ---------- Yardımcılar ----------

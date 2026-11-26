@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using MimicGame.Items;
+using MimicGame.Mimic;
 using MimicGame.Player;
 using MimicGame.UI;
 using Unity.Netcode;
@@ -31,6 +32,14 @@ namespace MimicGame.Network
         readonly NetworkVariable<bool> crouching = new NetworkVariable<bool>(false,
             NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Owner);
 
+        readonly NetworkVariable<int> colorIndex = new NetworkVariable<int>(0,
+            NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
+        /// <summary>Sunucudaki/uzak oyuncuda senkron eğilme durumu.</summary>
+        public bool IsCrouchingNet => crouching.Value;
+        public int ColorIndex => colorIndex.Value;
+        public Color BodyColor => PlayerAppearance.GetColor(colorIndex.Value);
+
         PlayerMotor motor;
         PlayerLook look;
         float shownHeight = 1.8f;
@@ -49,6 +58,10 @@ namespace MimicGame.Network
         public override void OnNetworkSpawn()
         {
             All.Add(this);
+            // Renk: sunucu atar, herkes uygular
+            if (IsServer) colorIndex.Value = (int)(OwnerClientId % (ulong)PlayerAppearance.Palette.Length);
+            colorIndex.OnValueChanged += OnColorChanged;
+            PlayerAppearance.ApplyColor(bodyRenderer, colorIndex.Value);
             // Eşyalar oyuncu kapsülüyle çarpışmasın
             foreach (var item in Item.All)
                 if (item != null) item.IgnorePlayer(Controller);
@@ -86,6 +99,7 @@ namespace MimicGame.Network
         public override void OnNetworkDespawn()
         {
             All.Remove(this);
+            colorIndex.OnValueChanged -= OnColorChanged;
 
             // Sunucu: oyuncunun taşıdığı eşyaları ayaklarının altına bırak
             if (IsServer && NetworkManager != null && !NetworkManager.ShutdownInProgress)
@@ -109,6 +123,8 @@ namespace MimicGame.Network
                 PlayerLook.SetCursorLocked(false);
             }
         }
+
+        void OnColorChanged(int oldValue, int newValue) => PlayerAppearance.ApplyColor(bodyRenderer, newValue);
 
         void SetEnabled<T>(bool on) where T : Behaviour
         {
@@ -147,11 +163,6 @@ namespace MimicGame.Network
         }
 
         // 2 m'lik kapsül primitifini verilen boya göre ölçekler
-        void ApplyBody(float height)
-        {
-            if (body == null) return;
-            body.localScale = new Vector3(0.7f, height * 0.5f, 0.7f);
-            body.localPosition = new Vector3(0f, height * 0.5f, 0f);
-        }
+        void ApplyBody(float height) => PlayerAppearance.ApplyBody(body, height);
     }
 }

@@ -82,6 +82,8 @@ namespace MimicGame.Voice
 
         void Update()
         {
+            // Sunucu: konuşma bitiş zamanlayıcısı (kare başına bir kez işler)
+            if (IsSpawned && IsServer) SpeechTracker.Tick();
             if (!IsSpawned || !IsOwner) return;
 
             // Sessize alma, yakalama başlatılamamış olsa da çalışsın
@@ -107,6 +109,8 @@ namespace MimicGame.Voice
         {
             var data = p.data;
             if (data == null || data.Length == 0) return;
+            // Host'un kendi sesi: sunucu konuşma sinyali
+            if (IsServer) SpeechTracker.Mark(OwnerClientId, transform.position);
 
             if (p.codec == VoiceCapture.CodecPcm16)
             {
@@ -135,6 +139,8 @@ namespace MimicGame.Voice
 
         void Receive(byte codec, byte[] data)
         {
+            if (IsServer && !IsOwner && data != null && data.Length > 0)
+                SpeechTracker.Mark(OwnerClientId, transform.position);
             if (IsOwner || voicePlayer == null || data == null) return;
             if (data.Length == 0 || data.Length > MaxIncoming) return;
 

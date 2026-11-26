@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using MimicGame.Mimic;
 using Steamworks;
 using Unity.Netcode;
 using Unity.Netcode.Transports.UTP;
@@ -20,7 +21,7 @@ namespace MimicGame.Network
         List<Friend> friends = new List<Friend>();
         Vector2 friendsScroll;
 
-        GUIStyle labelStyle, centerStyle, fieldStyle, buttonStyle;
+        GUIStyle labelStyle, centerStyle, fieldStyle, buttonStyle, toggleStyle;
         float styleScale = -1f;
         NetworkManager subscribed;
 
@@ -118,7 +119,7 @@ namespace MimicGame.Network
             bool connecting = nm.IsListening;
             if (tab < 0) tab = SteamBootstrap.Available ? 0 : 1;
             var white = Texture2D.whiteTexture;
-            float ph = (tab == 0 ? 600f : 560f) * s;
+            float ph = (tab == 0 ? 656f : 616f) * s;
             var panel = new Rect((Screen.width - 520f * s) * 0.5f, (Screen.height - ph) * 0.5f, 520f * s, ph);
             GUI.color = new Color(0f, 0f, 0f, 0.75f);
             GUI.DrawTexture(panel, white);
@@ -150,6 +151,11 @@ namespace MimicGame.Network
             var small = new GUIStyle(centerStyle) { wordWrap = true, fontSize = Mathf.RoundToInt(18f * s) };
             if (tab == 0) DrawSteamTab(x, y, w, h, gap, s, small);
             else DrawLocalTab(nm, x, y, w, h, gap, small);
+
+            // Gizlilik: sesimin taklit edilmesine izin ver
+            bool allow = GUI.Toggle(new Rect(x, panel.yMax - 50f * s, w, 36f * s), ClipSharing.AllowMimicry,
+                "Sesimin taklit edilmesine izin ver", toggleStyle);
+            if (allow != ClipSharing.AllowMimicry) ClipSharing.AllowMimicry = allow;
         }
 
         void DrawFriendsPanel(SteamLobby lobby, float s)
@@ -325,6 +331,11 @@ namespace MimicGame.Network
             centerStyle = new GUIStyle(labelStyle) { alignment = TextAnchor.MiddleCenter };
             fieldStyle = new GUIStyle(GUI.skin.textField) { fontSize = Mathf.RoundToInt(22f * s), alignment = TextAnchor.MiddleLeft };
             buttonStyle = new GUIStyle(GUI.skin.button) { fontSize = Mathf.RoundToInt(22f * s) };
+            toggleStyle = new GUIStyle(GUI.skin.toggle) { fontSize = Mathf.RoundToInt(18f * s) };
+            toggleStyle.normal.textColor = Color.white;
+            toggleStyle.onNormal.textColor = Color.white;
+            toggleStyle.hover.textColor = Color.white;
+            toggleStyle.onHover.textColor = Color.white;
         }
     }
 }

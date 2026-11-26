@@ -1,4 +1,5 @@
 using MimicGame.Items;
+using MimicGame.Mimic;
 using UnityEngine;
 
 namespace MimicGame.Voice
@@ -254,6 +255,7 @@ namespace MimicGame.Voice
                 if (col == null) continue;
                 if (col is CharacterController) continue;
                 if (col.GetComponentInParent<Item>() != null) continue;
+                if (col.GetComponentInParent<MimicAI>() != null) continue; // taklitçinin kendi kapsülü
                 return true;
             }
             return false;
