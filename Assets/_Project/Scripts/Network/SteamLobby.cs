@@ -229,6 +229,16 @@ namespace MimicGame.Network
             if (nm.IsHost) return; // kendi lobimize girdik
 
             if (nm.IsListening) return; // zaten bağlanıyor/bağlı
+
+            // Steam bir hesabın kendine bağlanmasına izin vermez (ör. aynı bilgisayarda iki pencere)
+            if (lobby.Owner.Id == SteamClient.SteamId)
+            {
+                Leave();
+                Status = "Bu lobi senin Steam hesabına ait. Steam ile kendine bağlanamazsın; " +
+                         "başka bir hesaptan (arkadaşın) katılmalı. Aynı bilgisayarda test için 'Yerel (IP)' sekmesini kullan.";
+                return;
+            }
+
             var t = EnsureFacepunchTransport();
             t.targetSteamId = lobby.Owner.Id;
             UseFacepunch();
