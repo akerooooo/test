@@ -16,7 +16,7 @@ namespace MimicGame.Mimic
         public float firstSpawnSeconds = 15f;
         public int mimicCount = 1;
 
-        const float MinSpawnDistance = 12f;
+        const float MinSpawnDistance = 8f; // küçük test binası için
 
         bool wasServer;
         float serverStart;
@@ -115,7 +115,7 @@ namespace MimicGame.Mimic
                 for (int tries = 0; tries < 8 && best == null; tries++)
                     best = spawnPoints[Random.Range(0, spawnPoints.Length)];
                 if (best == null) return transform.position;
-                Debug.LogWarning("[Taklitçi] Uygun doğma noktası yok (uzaklık/görüş); rastgele seçildi.");
+                Debug.Log("[Taklitçi] Uzak ve görünmeyen doğma noktası yok; rastgele seçildi.");
             }
             return best.position;
         }
