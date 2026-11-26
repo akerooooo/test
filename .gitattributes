@@ -29,3 +29,10 @@
 *.dylib filter=lfs diff=lfs merge=lfs -text
 *.bin filter=lfs diff=lfs merge=lfs -text
 *.bytes filter=lfs diff=lfs merge=lfs -text
+
+# Küçük üçüncü parti eklentiler LFS dışında (normal git)
+Assets/ThirdParty/FacepunchTransport/** !filter !diff !merge
+Assets/ThirdParty/FacepunchTransport/**/*.dll binary
+Assets/ThirdParty/FacepunchTransport/**/*.so binary
+Assets/ThirdParty/FacepunchTransport/**/*.lib binary
+Assets/ThirdParty/FacepunchTransport/**/*.bundle binary
