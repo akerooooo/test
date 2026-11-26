@@ -37,6 +37,8 @@ namespace MimicGame.Voice
         readonly MemoryStream decodeStream = new MemoryStream(8192);
         float[] decodeFloats = new float[4096];
 
+        bool warnedNoCapture;
+
         void Awake()
         {
             input = GetComponent<PlayerInputReader>();
@@ -47,8 +49,16 @@ namespace MimicGame.Voice
             if (!IsOwner) return;
             Local = this;
             IsMuted = false;
-            capture = new VoiceCapture(SteamBootstrap.Available);
-            capture.LocalPcm += ForwardLocalPcm;
+            try
+            {
+                capture = new VoiceCapture(SteamBootstrap.Available);
+                capture.LocalPcm += ForwardLocalPcm;
+            }
+            catch (Exception e)
+            {
+                capture = null;
+                Debug.LogWarning("[Ses] Yakalama başlatılırken hata: " + e);
+            }
         }
 
         public override void OnNetworkDespawn()
@@ -72,9 +82,19 @@ namespace MimicGame.Voice
 
         void Update()
         {
-            if (!IsSpawned || !IsOwner || capture == null) return;
+            if (!IsSpawned || !IsOwner) return;
 
+            // Sessize alma, yakalama başlatılamamış olsa da çalışsın
             if (input != null && input.MutePressed) IsMuted = !IsMuted;
+            if (capture == null)
+            {
+                if (!warnedNoCapture)
+                {
+                    warnedNoCapture = true;
+                    Debug.LogWarning("[Ses] Mikrofon yakalama başlatılamadı; bu oyuncunun sesi gönderilmiyor.");
+                }
+                return;
+            }
             capture.SetTransmitting(!IsMuted);
             if (IsMuted) return;
 

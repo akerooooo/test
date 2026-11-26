@@ -345,7 +345,8 @@ namespace MimicGame.EditorTools
             var sesGo = new GameObject("Ses");
             sesGo.transform.SetParent(camGo.transform, false);
             sesGo.transform.localPosition = new Vector3(0f, -0.1f, 0f);
-            sesGo.AddComponent<AudioSource>();
+            var sesSource = sesGo.AddComponent<AudioSource>();
+            sesSource.playOnAwake = false; // klip VoicePlayer tarafından oluşturulur
             sesGo.AddComponent<AudioLowPassFilter>();
             voice.voicePlayer = sesGo.AddComponent<VoicePlayer>();
 
