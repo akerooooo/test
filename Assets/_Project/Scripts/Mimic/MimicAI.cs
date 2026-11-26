@@ -760,6 +760,11 @@ namespace MimicGame.Mimic
         void ServerTick()
         {
             float now = Time.time;
+
+            // Güvenlik: hızlı hareket ederken eğik kalmasın
+            if (crouching.Value && agent != null && agent.enabled && agent.velocity.magnitude > 2.6f)
+                crouching.Value = false;
+
             if (now >= nextRetarget)
             {
                 nextRetarget = now + 30f;
@@ -829,6 +834,11 @@ namespace MimicGame.Mimic
                 needRenav = true;
                 if (crouching.Value != walkCrouch) crouching.Value = walkCrouch;
             }
+            else if (crouching.Value)
+            {
+                // Bakınma/grup parçası eğik bittiyse ayağa kalk (kısa kalmasın)
+                crouching.Value = false;
+            }
             walkSnippetActive = false;
         }
 
@@ -840,7 +850,9 @@ namespace MimicGame.Mimic
                 AfterPlayback();
                 return;
             }
-            if (crouching.Value != playback.Crouch) crouching.Value = playback.Crouch;
+            // Hızlı giderken eğilmiş görünmesin (oyuncular eğilerek koşamaz)
+            bool wantCrouch = playback.Crouch && (agent == null || !agent.enabled || agent.velocity.magnitude < 2.4f);
+            if (crouching.Value != wantCrouch) crouching.Value = wantCrouch;
             if (flashlightOn.Value != playback.Flashlight) flashlightOn.Value = playback.Flashlight;
             while (lastJumpPulse < playback.JumpPulse) { lastJumpPulse++; jumpCount.Value++; }
         }
