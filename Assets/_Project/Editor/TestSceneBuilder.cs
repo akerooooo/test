@@ -264,21 +264,20 @@ namespace MimicGame.EditorTools
             Deco("Klima Ünitesi 2", t, new Vector3(-4f, 8.6f, -2f), new Vector3(2.5f, 1.2f, 2f), metal);
             Cylinder("Baca", t, new Vector3(-6f, 9.5f, 5f), new Vector3(0.9f, 1.5f, 0.9f), metal, false);
 
-            // Ana kapı (güney yüz, z = 10 dünya konumunda)
+            // Ana kapı (güney yüz, z = 10 dünya konumunda). Boyut ve görünüm iç mekândaki çıkış kapısıyla aynı:
+            // FacilityDoorKit (2.4 x 3.0 m çift kanat metal kapı, aynı çerçeve, malzeme ve çıkış lambası)
             float fz = -10f;
-            Deco("Kapı Direk Sol", t, new Vector3(-1.9f, 1.9f, fz - 0.2f), new Vector3(0.4f, 3.8f, 0.5f), concrete);
-            Deco("Kapı Direk Sağ", t, new Vector3(1.9f, 1.9f, fz - 0.2f), new Vector3(0.4f, 3.8f, 0.5f), concrete);
-            Deco("Kapı Üst Kiriş", t, new Vector3(0f, 3.9f, fz - 0.2f), new Vector3(4.2f, 0.4f, 0.5f), concrete);
+            Box("Kapı Direk Sol", t, new Vector3(-1.6f, 1.8f, fz - 0.2f), new Vector3(0.5f, 3.6f, 0.5f), concrete);
+            Box("Kapı Direk Sağ", t, new Vector3(1.6f, 1.8f, fz - 0.2f), new Vector3(0.5f, 3.6f, 0.5f), concrete);
+            Deco("Kapı Üst Kiriş", t, new Vector3(0f, 3.3f, fz - 0.2f), new Vector3(4.0f, 0.6f, 0.5f), concrete);
             Deco("Sundurma", t, new Vector3(0f, 4.5f, fz - 1.4f), new Vector3(6f, 0.2f, 2.8f), metal);
             Deco("Uyarı Şeridi Sol", t, new Vector3(-2.35f, 1.7f, fz - 0.47f), new Vector3(0.25f, 3.4f, 0.04f), yellow);
             Deco("Uyarı Şeridi Sağ", t, new Vector3(2.35f, 1.7f, fz - 0.47f), new Vector3(0.25f, 3.4f, 0.04f), yellow);
 
-            var panel = Box("Ana Kapı", t, new Vector3(0f, 1.7f, fz - 0.1f), new Vector3(3.2f, 3.4f, 0.2f), doorMat);
-            panel.AddComponent<FacilityDoor>(); // etkileşim: içeri gir
+            // Kit'in yerel +Z yönü kapının önüdür (cephede güney = -Z), bu yüzden 180° döner
+            var doorKit = FacilityDoorKit.Build(t, "Ana Kapı", new Vector3(0f, 0f, fz - 0.1f), 180f, FacilityDoorMats(), false, 0.45f);
+            foreach (var tr in doorKit.GetComponentsInChildren<Transform>()) tr.gameObject.isStatic = true;
 
-            // Kapı üstü lamba (sodyum)
-            Deco("Kapı Lambası", t, new Vector3(0f, 4.35f, fz - 0.55f), new Vector3(0.6f, 0.18f, 0.35f), metal);
-            Deco("Kapı Lambası Cam", t, new Vector3(0f, 4.24f, fz - 0.55f), new Vector3(0.45f, 0.04f, 0.25f), sodium);
             var lampGo = new GameObject("Kapı Üstü Lamba Işığı");
             lampGo.transform.SetParent(t, false);
             lampGo.transform.localPosition = new Vector3(0f, 4.1f, fz - 0.8f);
@@ -447,22 +446,43 @@ namespace MimicGame.EditorTools
             gen.outsideExitPoint = new Vector3(0f, 0.05f, 7.5f);
             gen.outsideExitYaw = 180f;
 
-            gen.concrete = Mat("Tesis Beton", new Color(0.16f, 0.16f, 0.17f));
-            gen.wallMat = Mat("Tesis Pas Duvar", new Color(0.27f, 0.22f, 0.18f));
+            gen.concrete = Mat("Tesis Beton", new Color(0.17f, 0.17f, 0.18f));
             gen.ceilingMat = Mat("Tesis Tavan", new Color(0.1f, 0.1f, 0.11f));
             gen.lineMat = Mat("Sarı Çizgi", new Color(0.85f, 0.68f, 0.08f));
-            gen.metalMat = Mat("Tesis Metal", new Color(0.24f, 0.26f, 0.27f));
+            gen.rustMat = Mat("Tesis Pas Metal", new Color(0.3f, 0.16f, 0.1f));
             gen.crateMat = Mat("Tesis Sandık", new Color(0.33f, 0.24f, 0.13f));
             gen.deskMat = Mat("Tesis Ahşap", new Color(0.22f, 0.2f, 0.18f));
-            gen.doorFrameMat = Mat("Tesis Çerçeve", new Color(0.08f, 0.08f, 0.09f));
-            gen.doorMat = Mat("Tesis Çıkış Kapısı", new Color(0.14f, 0.22f, 0.18f));
-            gen.pipeMat = Mat("Tesis Boru", new Color(0.22f, 0.18f, 0.16f));
-            gen.screenMat = EmissiveMat("Tesis Ekran", new Color(0.03f, 0.1f, 0.08f), new Color(0.3f, 1.6f, 1.1f));
+            gen.pipeMat = Mat("Tesis Boru", new Color(0.25f, 0.2f, 0.17f));
+            gen.cableMat = Mat("Tesis Kablo", new Color(0.03f, 0.03f, 0.03f));
+            gen.paperMat = Mat("Tesis Kağıt", new Color(0.7f, 0.68f, 0.6f));
+            gen.fabricMat = Mat("Tesis Kumaş", new Color(0.18f, 0.2f, 0.17f));
+            gen.blackMat = Mat("Tesis Siyah", new Color(0.04f, 0.04f, 0.045f));
+            gen.screenMat = EmissiveMat("Tesis Ekran", new Color(0.03f, 0.1f, 0.08f), new Color(0.2f, 1.2f, 0.9f));
+            gen.screenAmberMat = EmissiveMat("Tesis Ekran Amber", new Color(0.15f, 0.08f, 0.02f), new Color(1.3f, 0.7f, 0.15f));
             gen.stripOnMat = EmissiveMat("Tesis Floresan Açık", new Color(0.8f, 0.9f, 1f), new Color(2f, 2.2f, 2.4f));
             gen.stripOffMat = Mat("Tesis Floresan Kapalı", new Color(0.08f, 0.08f, 0.09f));
             gen.ledGreenMat = EmissiveMat("Tesis LED Yeşil", new Color(0.05f, 0.3f, 0.05f), new Color(0.2f, 2f, 0.3f));
             gen.ledRedMat = EmissiveMat("Tesis LED Kırmızı", new Color(0.3f, 0.05f, 0.05f), new Color(2f, 0.2f, 0.15f));
-            gen.exitSignMat = EmissiveMat("Tesis Çıkış Levhası", new Color(0.05f, 0.3f, 0.1f), new Color(0.2f, 2f, 0.5f));
+            gen.ledAmberMat = EmissiveMat("Tesis LED Amber", new Color(0.3f, 0.2f, 0.03f), new Color(2f, 1.2f, 0.2f));
+
+            // Cephe kapısıyla ortak malzemeler (iki kapı birebir aynı görünür)
+            var dm = FacilityDoorMats();
+            gen.doorMat = dm.panel;
+            gen.doorFrameMat = dm.frame;
+            gen.metalMat = dm.metal;
+            gen.exitSignMat = dm.lamp;
+        }
+
+        // Cephe ve iç mekân çıkış kapısının ortak malzemeleri
+        static FacilityDoorMaterials FacilityDoorMats()
+        {
+            return new FacilityDoorMaterials
+            {
+                panel = Mat("Tesis Çıkış Kapısı", new Color(0.3f, 0.16f, 0.1f)),
+                frame = Mat("Tesis Çerçeve", new Color(0.08f, 0.08f, 0.09f)),
+                metal = Mat("Tesis Metal", new Color(0.24f, 0.26f, 0.27f)),
+                lamp = EmissiveMat("Tesis Çıkış Levhası", new Color(0.05f, 0.3f, 0.1f), new Color(0.2f, 2f, 0.5f))
+            };
         }
 
         static void BuildAtmosphere()

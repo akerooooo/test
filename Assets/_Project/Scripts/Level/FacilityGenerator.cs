@@ -8,14 +8,33 @@ using UnityEngine.InputSystem;
 
 namespace MimicGame.Level
 {
-    public enum RoomKind { Entrance, Corridor, Small, Medium, Hall, Storage }
+    public enum RoomKind
+    {
+        Entrance, Corridor, Stair,
+        ControlRoom, RadioHall, RadioRoom, Warehouse,
+        Storage, Office, Bunk, Generator, Locker, Workshop, Closet, PipeRoom, Mess
+    }
+
+    /// <summary>Yapay zekâ için oda bilgisi (dünya uzayında).</summary>
+    public sealed class RoomInfo
+    {
+        public RoomKind kind;
+        public string theme;
+        public Vector3 center;
+        public Bounds bounds;
+        public bool dark;
+        public bool corridor;
+        public bool large;
+        public int level;
+    }
 
     /// <summary>
-    /// Tesisin iç mekânını tohumdan (seed) üretir. Sunucu tohumu seçer; her istemci aynı yerleşimi
-    /// yalnızca System.Random(seed) ile ilkel şekillerden kurar. İç mekân haritanın çok altındadır (origin).
-    /// Sunucu üretimden sonra NavMesh'i yeniler, ganimetleri ağ nesnesi olarak doğurur.
+    /// Tesisin iç mekânını tohumdan (seed) üretir (çok katlı: giriş katı, bir üst, iki alt kat).
+    /// Sunucu tohumu seçer; her istemci aynı yerleşimi yalnızca System.Random(seed) ile ilkel şekillerden kurar.
+    /// İç mekân haritanın çok altındadır (y -130 ile -70 arası). Sunucu üretimden sonra NavMesh'i yeniler,
+    /// ganimetleri ağ nesnesi olarak doğurur. Giriş holü her turda aynıdır; geri kalanı tohuma bağlıdır.
     /// </summary>
-    public class FacilityGenerator : NetworkBehaviour
+    public partial class FacilityGenerator : NetworkBehaviour
     {
         // ---------- Genel durum ----------
 
@@ -29,8 +48,12 @@ namespace MimicGame.Level
 
         /// <summary>Dünya konumları: giriş holünden uzak odaların merkezleri.</summary>
         public static readonly List<Vector3> MimicSpawns = new List<Vector3>();
-        /// <summary>Dünya konumları: tüm oda merkezleri (taklitçi gezintisi için).</summary>
+        /// <summary>Dünya konumları: tüm oda merkezleri / koridor noktaları (taklitçi gezintisi için).</summary>
         public static readonly List<Vector3> WanderPoints = new List<Vector3>();
+        /// <summary>Oda listesi (dünya uzayında merkez, sınır, tema).</summary>
+        public static readonly List<RoomInfo> Rooms = new List<RoomInfo>();
+        /// <summary>Kapı açıklıklarının dünya konumları (yapay zekâ yavaşlama/duraklama için).</summary>
+        public static readonly List<Vector3> DoorPoints = new List<Vector3>();
 
         public static bool IsInteriorPoint(Vector3 p) => p.y < InteriorThresholdY;
 
@@ -44,6 +67,14 @@ namespace MimicGame.Level
             return true;
         }
 
+        /// <summary>Dünya konumunu içeren oda (yoksa null).</summary>
+        public static RoomInfo RoomAt(Vector3 p)
+        {
+            for (int i = 0; i < Rooms.Count; i++)
+                if (Rooms[i].bounds.Contains(p)) return Rooms[i];
+            return null;
+        }
+
         // ---------- Ayarlar ----------
 
         [Header("Dışarı çıkış noktası")]
@@ -52,88 +83,127 @@ namespace MimicGame.Level
 
         [Header("İçerik")]
         public LootTable lootTable;
-        public int minRooms = 14;
-        public int maxRooms = 20;
-        public int minLoot = 14;
-        public int maxLoot = 22;
+        [Tooltip("Toplam oda sayısı (koridor ve merdiven hariç) aralığı.")]
+        public int roomsMin = 22;
+        public int roomsMax = 30;
+        public int lootMin = 26;
+        public int lootMax = 40;
 
         [Header("Malzemeler (builder atar; boşsa çalışma anında üretilir)")]
         public Material concrete;
-        public Material wallMat;
         public Material ceilingMat;
         public Material lineMat;
         public Material metalMat;
+        public Material rustMat;
         public Material crateMat;
         public Material deskMat;
         public Material doorFrameMat;
         public Material doorMat;
         public Material screenMat;
+        public Material screenAmberMat;
         public Material stripOnMat;
         public Material stripOffMat;
         public Material ledGreenMat;
         public Material ledRedMat;
+        public Material ledAmberMat;
         public Material exitSignMat;
         public Material pipeMat;
+        public Material cableMat;
+        public Material paperMat;
+        public Material fabricMat;
+        public Material blackMat;
 
         public Vector3 ArrivalPoint => genRoot != null ? genRoot.transform.TransformPoint(arrivalLocal) : transform.position;
         public float ArrivalYaw => 0f;
         public Vector3 OutsideExitPoint => outsideExitPoint;
         public float OutsideExitYaw => outsideExitYaw;
         public int Seed => seed.Value;
-        public int RoomCount => rooms.Count;
+        public int RoomCount => spaces.Count;
         public int LootPointCount => lootPoints.Count;
 
         // ---------- Sabitler ----------
 
-        const float Cell = 4f;
-        const float WallH = 4f;
-        const float WallT = 0.3f;
-        const float DoorW = 2f;
-        const float DoorH = 2.6f;
+        const int G = 128;          // ızgara boyu (1 m hücre)
+        const int Org = 48;         // ızgara orijin kayması
+        const int OG = G * 2;       // doluluk ızgarası (0.5 m)
+        const int Levels = 4;
+        const int EntLv = 1;        // giriş katı dizini
+        const float StepH = 4f;     // kat aralığı
+        const float WallT = 0.2f;
+        const float SlabT = 0.15f;
+        const float CorridorH = 3.0f;
+        const float RoomH = 3.2f;
+        const float HallH = 6.0f;
+        const float OpenW = 1.6f;   // sıradan kapı açıklığı
+        const float OpenHt = 2.4f;
 
-        static readonly int[] DX = { 0, 1, 0, -1 };
-        static readonly int[] DZ = { 1, 0, -1, 0 };
+        // Kat tabanları (üretici-yerel y): 0 üst kat, 1 giriş, 2 ve 3 alt katlar
+        static readonly float[] LevelBase = { 4f, 0f, -4f, -8f };
 
-        sealed class Room
+        struct RectI
         {
-            public RoomKind kind;
             public int x, z, w, d;
-            public bool dark;
-            public Transform root;
-            public Vector3 center;
-            public int Cells => w * d;
+            public RectI(int x, int z, int w, int d) { this.x = x; this.z = z; this.w = w; this.d = d; }
         }
 
-        struct Slot
+        sealed class Space
         {
-            public Room room;
-            public int x, z, dir;
+            public int id;                 // 1 tabanlı
+            public RoomKind kind;
+            public int lv;                 // (merdiven için: üst kat)
+            public int lvLow;              // merdiven için alt kat; diğerlerinde lv
+            public float h;
+            public int paint;
+            public int floorVar;
+            public int variant;
+            public float density;
+            public bool seed;
+            public bool lit;
+            public bool dark => !lit;
+            public bool nearUpper;         // merdiven: yakın uç üst katta mı
+            public int dirX, dirZ;         // merdiven: yakın uçtan uzak uca yön
+            public readonly List<RectI> rects = new List<RectI>(2);
+            public Transform root, rootUp;
+            public bool IsStair => kind == RoomKind.Stair;
+            public bool IsCorridor => kind == RoomKind.Corridor;
         }
 
-        sealed class Spot
+        sealed class DoorRec
         {
-            public Vector3 pos;
-            public Vector3 inward;
-            public bool corner;
+            public int lv;
+            public bool alongX;
+            public int line, start, n;
+            public float width, height;
+            public int kind;               // 1 kapı, 2 açık geçit, 3 çıkış kapısı
+            public int a, b;
+        }
+
+        sealed class Grid
+        {
+            public readonly int[] owner = new int[G * G];
+            public readonly byte[] hType = new byte[G * G];
+            public readonly byte[] vType = new byte[G * G];
+            public readonly bool[] occ = new bool[OG * OG];
         }
 
         // Sunucu yazar, herkes okur
         readonly NetworkVariable<int> seed = new NetworkVariable<int>(0,
             NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
 
-        readonly List<Room> rooms = new List<Room>();
-        readonly Dictionary<Vector2Int, Room> cellRoom = new Dictionary<Vector2Int, Room>();
-        readonly HashSet<Vector3Int> openEdges = new HashSet<Vector3Int>();
-        readonly List<Slot> slots = new List<Slot>();
-        readonly List<Vector3> lootPoints = new List<Vector3>(); // üretici-yerel konumlar
-        readonly Vector3Int exitEdge = new Vector3Int(1, 0, 0);  // giriş holünün güney orta kenarı
+        readonly List<Space> spaces = new List<Space>();
+        readonly List<DoorRec> doors = new List<DoorRec>();
+        readonly List<Vector3> lootPoints = new List<Vector3>(); // üretici-yerel konumlar (y dahil)
+        Grid[] grids;
 
         GameObject genRoot;
-        Vector3 arrivalLocal = new Vector3(6f, 0.05f, 2.2f);
+        Transform[] levelRoots;
+        Transform[] wallRoots;
+        LightCuller culler;
+        Vector3 arrivalLocal = new Vector3(4.5f, 0.05f, 1.8f);
         int generatedSeed;
         bool lootSpawned;
-
-        static Mesh cubeMesh, cylinderMesh;
+        RoomKind lastKind = RoomKind.Entrance;
+        int radioHallCount, radioRoomCount, generatorCount, controlCount;
 
         // ---------- Ağ yaşam döngüsü ----------
 
@@ -141,7 +211,7 @@ namespace MimicGame.Level
         {
             Instance = this;
             seed.OnValueChanged += OnSeedChanged;
-            if (IsServer) seed.Value = Random.Range(1, int.MaxValue); // her sunucu başlangıcında yeni tohum
+            if (IsServer) seed.Value = NewSeed(); // her sunucu başlangıcında yeni tohum
             TryGenerate();
         }
 
@@ -156,6 +226,18 @@ namespace MimicGame.Level
         {
             if (Instance == this) { ClearGenerated(); Instance = null; }
             base.OnDestroy();
+        }
+
+        // Zaman, GUID ve Unity rastgeleliğinden karışık, sıfırdan farklı, pozitif tohum
+        static int NewSeed()
+        {
+            long t = System.DateTime.UtcNow.Ticks;
+            int a = System.Environment.TickCount;
+            int b = System.Guid.NewGuid().GetHashCode();
+            int c = Random.Range(1, int.MaxValue);
+            int s = (int)((t ^ (t >> 32)) & 0x7FFFFFFF) ^ (a * 73856093) ^ b ^ c;
+            s &= 0x7FFFFFFF;
+            return s == 0 ? 1 : s;
         }
 
         void OnSeedChanged(int oldValue, int newValue) => TryGenerate();
@@ -180,7 +262,7 @@ namespace MimicGame.Level
 
             if (IsServer && NetworkManager != null && NetworkManager.IsHost && Keyboard.current != null &&
                 Keyboard.current.f10Key.wasPressedThisFrame)
-                Debug.Log("[Tesis] Tohum " + seed.Value + ", " + rooms.Count + " oda, " + lootPoints.Count + " ganimet noktası");
+                Debug.Log("[Tesis] Tohum " + seed.Value + ", " + spaces.Count + " alan, " + lootPoints.Count + " ganimet noktası");
         }
 
         // ---------- Üretim ----------
@@ -194,22 +276,37 @@ namespace MimicGame.Level
 
             genRoot = new GameObject("Tesis (üretilen)");
             genRoot.transform.SetParent(transform, false);
+            culler = genRoot.AddComponent<LightCuller>();
+
+            grids = new Grid[Levels];
+            for (int i = 0; i < Levels; i++) grids[i] = new Grid();
+            levelRoots = new Transform[Levels];
+            wallRoots = new Transform[Levels];
+            for (int i = 0; i < Levels; i++)
+            {
+                var lr = new GameObject("Kat " + i);
+                lr.transform.SetParent(genRoot.transform, false);
+                lr.transform.localPosition = new Vector3(0f, LevelBase[i], 0f);
+                levelRoots[i] = lr.transform;
+                var wr = new GameObject("Duvarlar");
+                wr.transform.SetParent(lr.transform, false);
+                wallRoots[i] = wr.transform;
+            }
 
             BuildLayout(rng);
-            foreach (var r in rooms)
-                if (r.kind != RoomKind.Entrance) r.dark = rng.NextDouble() < 0.3;
+            AssignAppearance(rng);
+            CreateSpaceRoots();
+            ReserveDoorZones();
+            BuildAllSlabs();
+            for (int li = 0; li < Levels; li++) BuildLevelWalls(li);
+            BuildExitDoor();
 
-            foreach (var r in rooms) BuildRoomShell(r, rng);
-
-            // Duvarlar (her kenar bir kez)
-            var built = new HashSet<Vector3Int>();
-            foreach (var r in rooms) BuildRoomWalls(r, built);
-
-            foreach (var r in rooms)
+            foreach (var sp in spaces)
             {
-                DecorateRoom(r, rng);
-                AddRoomLights(r, rng);
+                Decorate(sp, rng);
+                AddSpaceLights(sp, rng);
             }
+            AddEmergencyLights(rng);
 
             CollectPoints();
             CombineStatic();
@@ -219,7 +316,7 @@ namespace MimicGame.Level
 
             Generated = true;
             OnGenerated?.Invoke();
-            Debug.Log("[Tesis] Oluşturuldu: tohum " + s + ", " + rooms.Count + " oda, " + lootPoints.Count + " ganimet noktası");
+            Debug.Log("[Tesis] Oluşturuldu: tohum " + s + ", " + spaces.Count + " alan, " + lootPoints.Count + " ganimet noktası");
         }
 
         void ClearGenerated()
@@ -229,593 +326,684 @@ namespace MimicGame.Level
             generatedSeed = 0;
             MimicSpawns.Clear();
             WanderPoints.Clear();
-            rooms.Clear();
-            cellRoom.Clear();
-            openEdges.Clear();
-            slots.Clear();
+            Rooms.Clear();
+            DoorPoints.Clear();
+            spaces.Clear();
+            doors.Clear();
             lootPoints.Clear();
+            grids = null;
+            lastKind = RoomKind.Entrance;
+            radioHallCount = radioRoomCount = generatorCount = controlCount = 0;
             if (genRoot != null) Destroy(genRoot);
             genRoot = null;
+            culler = null;
+        }
+
+        // ---------- Izgara yardımcıları ----------
+
+        static bool InGrid(int x, int z)
+        {
+            int i = x + Org, j = z + Org;
+            return i >= 0 && j >= 0 && i < G && j < G;
+        }
+
+        int Owner(int li, int x, int z)
+        {
+            if (!InGrid(x, z)) return 0;
+            int v = grids[li].owner[(z + Org) * G + (x + Org)];
+            return v > 0 ? v : 0;
+        }
+
+        int RawOwner(int li, int x, int z)
+        {
+            if (!InGrid(x, z)) return -1;
+            return grids[li].owner[(z + Org) * G + (x + Org)];
+        }
+
+        byte HT(int li, int x, int z) => InGrid(x, z) ? grids[li].hType[(z + Org) * G + (x + Org)] : (byte)0;
+        byte VT(int li, int x, int z) => InGrid(x, z) ? grids[li].vType[(z + Org) * G + (x + Org)] : (byte)0;
+
+        bool RectFree(int li, RectI r)
+        {
+            if (r.w < 1 || r.d < 1) return false;
+            if (r.x < -Org + 3 || r.z < -Org + 3 || r.x + r.w > G - Org - 3 || r.z + r.d > G - Org - 3) return false;
+            for (int i = 0; i < r.w; i++)
+                for (int j = 0; j < r.d; j++)
+                    if (RawOwner(li, r.x + i, r.z + j) != 0) return false;
+            return true;
+        }
+
+        void FillCells(int li, RectI r, int id)
+        {
+            for (int i = 0; i < r.w; i++)
+                for (int j = 0; j < r.d; j++)
+                    grids[li].owner[(r.z + j + Org) * G + (r.x + i + Org)] = id;
+        }
+
+        void MarkBlocked(int li, RectI r)
+        {
+            for (int i = 0; i < r.w; i++)
+                for (int j = 0; j < r.d; j++)
+                {
+                    int idx = (r.z + j + Org) * G + (r.x + i + Org);
+                    if (grids[li].owner[idx] == 0) grids[li].owner[idx] = -1;
+                }
+        }
+
+        static bool IsTall(RoomKind k) => k == RoomKind.ControlRoom || k == RoomKind.RadioHall || k == RoomKind.Warehouse;
+
+        static float HeightFor(RoomKind k)
+        {
+            if (k == RoomKind.Corridor) return CorridorH;
+            if (IsTall(k)) return HallH;
+            return RoomH;
+        }
+
+        float HeightAt(int li, int id)
+        {
+            if (id <= 0) return 0f;
+            var sp = spaces[id - 1];
+            if (sp.IsStair) return li == sp.lv ? RoomH : StepH;
+            return sp.h;
+        }
+
+        bool IsStairLow(int li, int id) => id > 0 && spaces[id - 1].IsStair && li == spaces[id - 1].lvLow;
+
+        bool CanPlace(int li, RoomKind kind, RectI r)
+        {
+            if (!RectFree(li, r)) return false;
+            if (IsTall(kind) && li > 0 && !RectFree(li - 1, r)) return false;
+            return true;
+        }
+
+        Space AddSpace(RoomKind kind, int li, RectI r)
+        {
+            var sp = new Space { id = spaces.Count + 1, kind = kind, lv = li, lvLow = li, h = HeightFor(kind), density = 1f };
+            sp.rects.Add(r);
+            spaces.Add(sp);
+            FillCells(li, r, sp.id);
+            if (IsTall(kind) && li > 0) MarkBlocked(li - 1, r);
+            return sp;
+        }
+
+        void AddWing(Space sp, RectI r)
+        {
+            sp.rects.Add(r);
+            FillCells(sp.lv, r, sp.id);
+            if (IsTall(sp.kind) && sp.lv > 0) MarkBlocked(sp.lv - 1, r);
+        }
+
+        // Kapı / açık geçit işaretle: alongX = kenar X boyunca uzanır (z = line çizgisinde)
+        void AddDoorAt(int li, bool alongX, int line, int start, int n, int kind, float width, float height)
+        {
+            var g = grids[li];
+            for (int i = 0; i < n; i++)
+            {
+                if (alongX) g.hType[(line + Org) * G + (start + i + Org)] = (byte)kind;
+                else g.vType[(start + i + Org) * G + (line + Org)] = (byte)kind;
+            }
+            var dr = new DoorRec { lv = li, alongX = alongX, line = line, start = start, n = n, width = width, height = height, kind = kind };
+            if (alongX) { dr.a = Owner(li, start, line - 1); dr.b = Owner(li, start, line); }
+            else { dr.a = Owner(li, line - 1, start); dr.b = Owner(li, line, start); }
+            doors.Add(dr);
+        }
+
+        // ---------- Koridor geometrisi ----------
+
+        static bool AlongZ(Space c) => c.rects[0].d > c.rects[0].w;
+
+        static void CorridorRange(Space c, out int start, out int end)
+        {
+            var r = c.rects[0];
+            if (AlongZ(c)) { start = r.z; end = r.z + r.d; }
+            else { start = r.x; end = r.x + r.w; }
+        }
+
+        // Koridorun yan tarafına bitişik dikdörtgen: t koridor ekseni boyunca başlangıç, along o eksendeki uzunluk,
+        // depth dışa doğru derinlik, off dışa doğru kayma
+        RectI RectFor(Space c, int side, int t, int along, int depth, int off)
+        {
+            var r = c.rects[0];
+            if (AlongZ(c))
+            {
+                if (side > 0) return new RectI(r.x + r.w + off, t, depth, along);
+                return new RectI(r.x - off - depth, t, depth, along);
+            }
+            if (side > 0) return new RectI(t, r.z + r.d + off, along, depth);
+            return new RectI(t, r.z - off - depth, along, depth);
+        }
+
+        void MarkSide(int li, Space c, int side, int start, int n, int kind, float width, float height)
+        {
+            var r = c.rects[0];
+            bool alongZ = AlongZ(c);
+            int line = alongZ ? (side > 0 ? r.x + r.w : r.x) : (side > 0 ? r.z + r.d : r.z);
+            AddDoorAt(li, !alongZ, line, start, n, kind, width, height);
+        }
+
+        List<Space> CorridorsOn(int li)
+        {
+            var list = new List<Space>();
+            for (int i = 0; i < spaces.Count; i++)
+                if (spaces[i].IsCorridor && spaces[i].lv == li) list.Add(spaces[i]);
+            return list;
         }
 
         // ---------- Yerleşim ----------
 
         void BuildLayout(System.Random rng)
         {
-            var entrance = AddRoom(RoomKind.Entrance, 0, 0, 3, 3);
-            AddSlots(entrance);
+            int total = rng.Next(roomsMin, roomsMax + 1);
+            int r1 = Mathf.Max(7, Mathf.RoundToInt(total * 0.36f));
+            int r0 = Mathf.Max(4, Mathf.RoundToInt(total * 0.18f));
+            int r2 = Mathf.Max(5, Mathf.RoundToInt(total * 0.28f));
+            int r3 = Mathf.Max(3, total - r1 - r0 - r2);
 
-            int target = rng.Next(minRooms, maxRooms + 1);
-            int halls = 0;
-            for (int attempt = 0; attempt < 200 && rooms.Count < target && slots.Count > 0; attempt++)
+            // Giriş holü: her turda sabit
+            AddSpace(RoomKind.Entrance, EntLv, new RectI(0, 0, 9, 7));
+            var m = AddSpace(RoomKind.Corridor, EntLv, new RectI(3, 7, 3, rng.Next(28, 35)));
+            AddDoorAt(EntLv, true, 7, 3, 3, 2, 0f, 0f); // hol - ana koridor açık geçidi
+            AddDoorAt(EntLv, true, 0, 3, 3, 3, FacilityDoorSpec.Width, FacilityDoorSpec.Height); // çıkış kapısı
+            GrowCorridor(EntLv, m, rng, 0);
+            TryEndHall(EntLv, m, true, rng, RoomKind.ControlRoom);
+
+            // Katlar arası merdivenler (giriş katından yukarı ve aşağı)
+            int up = rng.Next(2, 4), down = rng.Next(2, 4);
+            for (int i = 0; i < up; i++) TryPlaceStairs(EntLv, 0, rng);
+            for (int i = 0; i < down; i++) TryPlaceStairs(EntLv, 2, rng);
+            FillRooms(EntLv, r1, rng);
+
+            GrowSeeds(0, rng);
+            FillRooms(0, r0, rng);
+
+            GrowSeeds(2, rng);
+            int down2 = rng.Next(1, 3) + 1;
+            for (int i = 0; i < down2; i++) TryPlaceStairs(2, 3, rng);
+            FillRooms(2, r2, rng);
+
+            GrowSeeds(3, rng);
+            FillRooms(3, r3, rng);
+
+            AddExtraDoors(rng);
+        }
+
+        // Koridora yan kollar: T ve artı kavşaklar, kısa çıkmaz kollar
+        void GrowCorridor(int li, Space c, System.Random rng, int depthLevel)
+        {
+            CorridorRange(c, out int start, out int end);
+            int len0 = end - start;
+            if (len0 < 12) return;
+            int nBr = depthLevel == 0 ? rng.Next(2, 5) : rng.Next(0, 2);
+            var usedT = new List<int>();
+            for (int i = 0; i < nBr; i++)
             {
-                int si = rng.Next(slots.Count);
-                var s = slots[si];
-                int nx = s.x + DX[s.dir], nz = s.z + DZ[s.dir];
-
-                if (cellRoom.TryGetValue(new Vector2Int(nx, nz), out var neighbor))
+                int t = 0;
+                bool ok = false;
+                for (int attempt = 0; attempt < 8 && !ok; attempt++)
                 {
-                    // Komşu zaten oda: ara sıra döngü oluşturmak için kapıyı aç
-                    if (neighbor != s.room && Edge(s.x, s.z, s.dir) != exitEdge && rng.NextDouble() < 0.15)
-                        openEdges.Add(Edge(s.x, s.z, s.dir));
-                    RemoveSlot(si);
-                    continue;
+                    t = start + 4 + rng.Next(Mathf.Max(1, len0 - 9));
+                    ok = true;
+                    for (int u = 0; u < usedT.Count; u++) if (Mathf.Abs(usedT[u] - t) < 7) ok = false;
                 }
+                if (!ok) continue;
+                usedT.Add(t);
 
-                var kind = PickKind(rng);
-                if (kind == RoomKind.Hall && halls >= 2) kind = RoomKind.Medium;
-                SizeOf(kind, rng, out int w, out int d);
-                if (!TryFit(s, nx, nz, w, d, rng, out int x0, out int z0)) continue;
-
-                var room = AddRoom(kind, x0, z0, w, d);
-                if (kind == RoomKind.Hall) halls++;
-                openEdges.Add(Edge(s.x, s.z, s.dir));
-                RemoveSlot(si);
-                AddSlots(room);
+                int side = rng.Next(2) == 0 ? 1 : -1;
+                bool cross = rng.NextDouble() < 0.35;
+                int sides = cross ? 2 : 1;
+                for (int k = 0; k < sides; k++)
+                {
+                    int sd = k == 0 ? side : -side;
+                    int len = rng.NextDouble() < 0.25 ? rng.Next(5, 9) : rng.Next(9, 24);
+                    RectI r = RectFor(c, sd, t, 3, len, 0);
+                    while (len >= 5 && !RectFree(li, r)) { len -= 2; r = RectFor(c, sd, t, 3, len, 0); }
+                    if (len < 5) continue;
+                    var b = AddSpace(RoomKind.Corridor, li, r);
+                    MarkSide(li, c, sd, t, 3, 2, 0f, 0f);
+                    if (depthLevel < 1 && len >= 10 && rng.NextDouble() < 0.45) GrowCorridor(li, b, rng, depthLevel + 1);
+                }
             }
         }
 
-        Room AddRoom(RoomKind kind, int x, int z, int w, int d)
+        // Koridor ucuna büyük salon ekle
+        bool TryEndHall(int li, Space c, bool atEnd, System.Random rng, RoomKind kind)
         {
-            var r = new Room { kind = kind, x = x, z = z, w = w, d = d };
-            r.center = new Vector3((x + w * 0.5f) * Cell, 0f, (z + d * 0.5f) * Cell);
-            for (int i = 0; i < w; i++)
-                for (int j = 0; j < d; j++)
-                    cellRoom[new Vector2Int(x + i, z + j)] = r;
-            rooms.Add(r);
-            return r;
+            int along = kind == RoomKind.ControlRoom ? 13 : 11;
+            int depth = kind == RoomKind.ControlRoom ? 10 : 9;
+            var r = c.rects[0];
+            bool alongZ = AlongZ(c);
+            RectI hr;
+            if (alongZ)
+                hr = new RectI(r.x - (along - 3) / 2, atEnd ? r.z + r.d : r.z - depth, along, depth);
+            else
+                hr = new RectI(atEnd ? r.x + r.w : r.x - depth, r.z - (along - 3) / 2, depth, along);
+            if (!CanPlace(li, kind, hr)) return false;
+            var hall = AddSpace(kind, li, hr);
+            if (kind == RoomKind.RadioHall) radioHallCount++;
+            if (kind == RoomKind.ControlRoom) controlCount++;
+            int line = atEnd ? (alongZ ? r.z + r.d : r.x + r.w) : (alongZ ? r.z : r.x);
+            int ds = (alongZ ? r.x : r.z) + rng.Next(2);
+            AddDoorAt(li, alongZ, line, ds, 2, 1, OpenW, OpenHt);
+            return hall != null;
         }
 
-        void AddSlots(Room r)
+        void GrowSeeds(int li, System.Random rng)
         {
-            for (int cx = r.x; cx < r.x + r.w; cx++)
-                for (int cz = r.z; cz < r.z + r.d; cz++)
-                    for (int dir = 0; dir < 4; dir++)
-                    {
-                        int nx = cx + DX[dir], nz = cz + DZ[dir];
-                        if (nx >= r.x && nx < r.x + r.w && nz >= r.z && nz < r.z + r.d) continue; // oda içi
-                        if (Edge(cx, cz, dir) == exitEdge && r.kind == RoomKind.Entrance) continue; // çıkış kapısı
-                        slots.Add(new Slot { room = r, x = cx, z = cz, dir = dir });
-                    }
-        }
-
-        void RemoveSlot(int index)
-        {
-            int last = slots.Count - 1;
-            slots[index] = slots[last];
-            slots.RemoveAt(last);
-        }
-
-        static RoomKind PickKind(System.Random rng)
-        {
-            int r = rng.Next(100);
-            if (r < 30) return RoomKind.Corridor;
-            if (r < 50) return RoomKind.Small;
-            if (r < 68) return RoomKind.Medium;
-            if (r < 82) return RoomKind.Storage;
-            return RoomKind.Hall;
-        }
-
-        static void SizeOf(RoomKind kind, System.Random rng, out int w, out int d)
-        {
-            switch (kind)
+            var list = CorridorsOn(li);
+            var seeds = new List<Space>();
+            for (int i = 0; i < list.Count; i++) if (list[i].seed) seeds.Add(list[i]);
+            for (int i = 0; i < seeds.Count; i++)
             {
-                case RoomKind.Corridor: w = 1; d = 3; break;
-                case RoomKind.Small: w = 2; d = 2; break;
-                case RoomKind.Medium: w = 3; d = 3; break;
-                case RoomKind.Hall: w = 4; d = 5; break;
-                case RoomKind.Storage: w = 2; d = 3; break;
-                default: w = 3; d = 3; break;
-            }
-            if (rng.Next(2) == 0) { int t = w; w = d; d = t; } // yön
-        }
-
-        bool TryFit(Slot s, int nx, int nz, int w, int d, System.Random rng, out int x0, out int z0)
-        {
-            x0 = 0; z0 = 0;
-            int span = (s.dir == 0 || s.dir == 2) ? w : d;
-            int start = rng.Next(span);
-            for (int k = 0; k < span; k++)
-            {
-                int off = (start + k) % span;
-                switch (s.dir)
+                GrowCorridor(li, seeds[i], rng, 0);
+                if (rng.NextDouble() < 0.7)
                 {
-                    case 0: x0 = nx - off; z0 = nz; break;
-                    case 2: x0 = nx - off; z0 = nz - d + 1; break;
-                    case 1: x0 = nx; z0 = nz - off; break;
-                    default: x0 = nx - w + 1; z0 = nz - off; break;
+                    RoomKind hk = (radioHallCount < 1 && rng.Next(2) == 0) ? RoomKind.RadioHall : RoomKind.Warehouse;
+                    if (!TryEndHall(li, seeds[i], true, rng, hk) && hk != RoomKind.Warehouse)
+                        TryEndHall(li, seeds[i], true, rng, RoomKind.Warehouse);
                 }
-                if (RectFree(x0, z0, w, d)) return true;
+            }
+        }
+
+        // ---------- Merdivenler ----------
+
+        // Yakın kattaki bir koridorun yanına 3x8 merdiven boşluğu, uzak katta onun ardına tohum koridoru koyar
+        bool TryPlaceStairs(int nearLv, int farLv, System.Random rng)
+        {
+            var corrs = CorridorsOn(nearLv);
+            if (corrs.Count == 0) return false;
+            for (int attempt = 0; attempt < 40; attempt++)
+            {
+                var c = corrs[rng.Next(corrs.Count)];
+                CorridorRange(c, out int start, out int end);
+                if (end - start < 8) continue;
+                int side = rng.Next(2) == 0 ? 1 : -1;
+                int t = start + 1 + rng.Next(end - start - 4);
+                if (t + 3 > end - 1) continue;
+                RectI shaft = RectFor(c, side, t, 3, 8, 0);
+                int seedLen = rng.Next(11, 18);
+                RectI seedR = RectFor(c, side, t, 3, seedLen, 8);
+                if (!RectFree(nearLv, shaft) || !RectFree(farLv, shaft)) continue;
+                if (!RectFree(farLv, seedR)) continue;
+
+                int dx = 0, dz = 0;
+                if (AlongZ(c)) dx = side; else dz = side;
+                var st = new Space
+                {
+                    id = spaces.Count + 1, kind = RoomKind.Stair,
+                    lv = Mathf.Min(nearLv, farLv), lvLow = Mathf.Max(nearLv, farLv),
+                    h = RoomH, nearUpper = nearLv < farLv, dirX = dx, dirZ = dz, density = 1f
+                };
+                st.rects.Add(shaft);
+                spaces.Add(st);
+                FillCells(nearLv, shaft, st.id);
+                FillCells(farLv, shaft, st.id);
+                var sc = AddSpace(RoomKind.Corridor, farLv, seedR);
+                sc.seed = true;
+
+                // Yakın uç: koridorun yan duvarında 3 m'lik açık geçit
+                MarkSide(nearLv, c, side, t, 3, 2, 0f, 0f);
+                // Uzak uç: tohum koridoruna açık geçit
+                if (dx != 0)
+                    AddDoorAt(farLv, false, dx > 0 ? shaft.x + shaft.w : shaft.x, shaft.z, 3, 2, 0f, 0f);
+                else
+                    AddDoorAt(farLv, true, dz > 0 ? shaft.z + shaft.d : shaft.z, shaft.x, 3, 2, 0f, 0f);
+                return true;
             }
             return false;
         }
 
-        bool RectFree(int x0, int z0, int w, int d)
+        // ---------- Odalar ----------
+
+        struct Slot
         {
-            for (int i = 0; i < w; i++)
-                for (int j = 0; j < d; j++)
-                    if (cellRoom.ContainsKey(new Vector2Int(x0 + i, z0 + j))) return false;
+            public Space corr;
+            public int side;
+            public int cursor;
+        }
+
+        static readonly RoomKind[] RoomKinds =
+        {
+            RoomKind.Storage, RoomKind.Office, RoomKind.Bunk, RoomKind.Generator, RoomKind.Locker,
+            RoomKind.Workshop, RoomKind.Closet, RoomKind.PipeRoom, RoomKind.Mess, RoomKind.Warehouse, RoomKind.RadioRoom
+        };
+        static readonly int[] RoomWeights = { 6, 5, 5, 3, 4, 4, 4, 3, 3, 2, 1 };
+
+        RoomKind PickKind(System.Random rng)
+        {
+            for (int tries = 0; tries < 8; tries++)
+            {
+                int total = 0;
+                for (int i = 0; i < RoomWeights.Length; i++) total += RoomWeights[i];
+                int r = rng.Next(total);
+                RoomKind k = RoomKinds[0];
+                for (int i = 0; i < RoomWeights.Length; i++)
+                {
+                    r -= RoomWeights[i];
+                    if (r < 0) { k = RoomKinds[i]; break; }
+                }
+                if (k == lastKind) continue; // art arda aynı şablon olmasın
+                if (k == RoomKind.Generator && generatorCount >= 2) continue;
+                if (k == RoomKind.RadioRoom && radioRoomCount >= 1) continue;
+                return k;
+            }
+            return RoomKind.Storage == lastKind ? RoomKind.Office : RoomKind.Storage;
+        }
+
+        static void SizeFor(RoomKind k, System.Random rng, out int along, out int depth, out int shape)
+        {
+            shape = 0; // 0 dikdörtgen, 1 L kanadı
+            switch (k)
+            {
+                case RoomKind.Storage: along = rng.Next(6, 10); depth = rng.Next(5, 8); if (rng.NextDouble() < 0.35) shape = 1; break;
+                case RoomKind.Office: along = rng.Next(5, 7); depth = rng.Next(4, 6); if (rng.NextDouble() < 0.2) shape = 1; break;
+                case RoomKind.Bunk:
+                    if (rng.NextDouble() < 0.5) { along = rng.Next(9, 12); depth = 4; }
+                    else { along = rng.Next(6, 9); depth = rng.Next(5, 7); }
+                    break;
+                case RoomKind.Generator: along = 8; depth = rng.Next(6, 9); break;
+                case RoomKind.Locker: along = rng.Next(5, 9); depth = rng.Next(4, 6); break;
+                case RoomKind.Workshop: along = rng.Next(7, 10); depth = rng.Next(5, 7); if (rng.NextDouble() < 0.3) shape = 1; break;
+                case RoomKind.Closet: along = 4; depth = rng.Next(3, 5); break;
+                case RoomKind.PipeRoom: along = rng.Next(5, 8); depth = rng.Next(5, 7); break;
+                case RoomKind.Mess: along = rng.Next(8, 10); depth = rng.Next(6, 8); break;
+                case RoomKind.Warehouse: along = 11; depth = 9; break;
+                case RoomKind.RadioRoom: along = 6; depth = 5; break;
+                default: along = 6; depth = 5; break;
+            }
+        }
+
+        void FillRooms(int li, int target, System.Random rng)
+        {
+            var slots = new List<Slot>();
+            var corrs = CorridorsOn(li);
+            for (int i = 0; i < corrs.Count; i++)
+            {
+                CorridorRange(corrs[i], out int start, out int end);
+                for (int sd = -1; sd <= 1; sd += 2)
+                    slots.Add(new Slot { corr = corrs[i], side = sd, cursor = start + rng.Next(3) });
+            }
+
+            int placed = 0, guard = 0;
+            while (placed < target && slots.Count > 0 && guard++ < 900)
+            {
+                int si = rng.Next(slots.Count);
+                var s = slots[si];
+                CorridorRange(s.corr, out int cs, out int ce);
+                if (s.cursor > ce - 4)
+                {
+                    slots[si] = slots[slots.Count - 1];
+                    slots.RemoveAt(slots.Count - 1);
+                    continue;
+                }
+
+                bool ok = false;
+                for (int k = 0; k < 3 && !ok; k++)
+                {
+                    RoomKind kind = PickKind(rng);
+                    ok = TryPlaceRoom(li, s.corr, s.side, s.cursor, ce, kind, rng, out int used);
+                    if (ok) { s.cursor += used + rng.Next(0, 2); lastKind = kind; placed++; }
+                }
+                if (!ok) s.cursor += 2;
+                slots[si] = s;
+            }
+        }
+
+        bool TryPlaceRoom(int li, Space c, int side, int t, int corrEnd, RoomKind kind, System.Random rng, out int used)
+        {
+            used = 0;
+            SizeFor(kind, rng, out int along, out int depth, out int shape);
+            if (t + along > corrEnd) along = corrEnd - t;
+            if (along < 4) return false;
+            RectI r = RectFor(c, side, t, along, depth, 0);
+            if (!CanPlace(li, kind, r)) return false;
+
+            var sp = AddSpace(kind, li, r);
+            if (kind == RoomKind.Generator) generatorCount++;
+            if (kind == RoomKind.RadioRoom) radioRoomCount++;
+
+            // L biçimli oda: uzak duvara bitişik bir kanat
+            if (shape == 1 && along >= 6)
+            {
+                int bw = rng.Next(3, along - 2);
+                int bd = rng.Next(3, 5);
+                int tb = rng.Next(2) == 0 ? t : t + along - bw;
+                RectI wing = RectFor(c, side, tb, bw, bd, depth);
+                if (RectFree(li, wing)) AddWing(sp, wing);
+            }
+
+            int ds = t + 1 + rng.Next(Mathf.Max(1, along - 3));
+            if (ds + 2 > t + along - 1) ds = t + along - 3;
+            MarkSide(li, c, side, ds, 2, 1, OpenW, OpenHt);
+            used = along;
             return true;
         }
 
-        // Hücre kenarı kimliği: (x, z, eksen). Eksen 0: X boyunca duvar (z çizgisi), 1: Z boyunca duvar (x çizgisi)
-        static Vector3Int Edge(int x, int z, int dir)
+        // Komşu alanlar arasına ek kapılar (döngüler / birden çok rota)
+        void AddExtraDoors(System.Random rng)
         {
-            switch (dir)
+            var pairs = new List<long>();
+            for (int i = 0; i < doors.Count; i++)
             {
-                case 0: return new Vector3Int(x, z + 1, 0);
-                case 1: return new Vector3Int(x + 1, z, 1);
-                case 2: return new Vector3Int(x, z, 0);
-                default: return new Vector3Int(x, z, 1);
-            }
-        }
-
-        // ---------- Kabuk: zemin, tavan, duvarlar ----------
-
-        void BuildRoomShell(Room r, System.Random rng)
-        {
-            var go = new GameObject("Oda " + rooms.IndexOf(r) + " (" + r.kind + ")");
-            go.transform.SetParent(genRoot.transform, false);
-            r.root = go.transform;
-
-            float sx = r.w * Cell, sz = r.d * Cell;
-            Block(r.root, "Zemin", new Vector3(r.center.x, -0.1f, r.center.z), new Vector3(sx, 0.2f, sz), concrete);
-            var ceil = Block(r.root, "Tavan", new Vector3(r.center.x, WallH + 0.1f, r.center.z),
-                new Vector3(sx, 0.2f, sz), ceilingMat);
-            ceil.AddComponent<NavMeshModifier>().ignoreFromBuild = true; // tavanın üstü yürünebilir sayılmasın
-        }
-
-        void BuildRoomWalls(Room r, HashSet<Vector3Int> built)
-        {
-            for (int cx = r.x; cx < r.x + r.w; cx++)
-                for (int cz = r.z; cz < r.z + r.d; cz++)
-                    for (int dir = 0; dir < 4; dir++)
-                    {
-                        cellRoom.TryGetValue(new Vector2Int(cx + DX[dir], cz + DZ[dir]), out var other);
-                        if (other == r) continue;
-                        var e = Edge(cx, cz, dir);
-                        if (!built.Add(e)) continue;
-                        bool open = other != null && openEdges.Contains(e);
-                        BuildWall(r.root, e, open);
-                        if (r.kind == RoomKind.Entrance && e == exitEdge) BuildExitDoor(r.root, e);
-                    }
-        }
-
-        void BuildWall(Transform parent, Vector3Int e, bool open)
-        {
-            bool alongX = e.z == 0;
-            Vector3 c = alongX
-                ? new Vector3((e.x + 0.5f) * Cell, 0f, e.y * Cell)
-                : new Vector3(e.x * Cell, 0f, (e.y + 0.5f) * Cell);
-            Vector3 along = alongX ? Vector3.right : Vector3.forward;
-
-            if (!open)
-            {
-                Block(parent, "Duvar", c + Vector3.up * (WallH * 0.5f), WallSize(alongX, Cell + WallT, WallH), wallMat);
-                return;
+                var d = doors[i];
+                if (d.a > 0 && d.b > 0) pairs.Add(PairKey(d.a, d.b));
             }
 
-            // Kapı boşluğu: iki yan parça + lento
-            float half = DoorW * 0.5f;
-            float segLen = (Cell * 0.5f + WallT * 0.5f) - half;
-            float segC = half + segLen * 0.5f;
-            Block(parent, "Duvar (sol)", c + along * -segC + Vector3.up * (WallH * 0.5f), WallSize(alongX, segLen, WallH), wallMat);
-            Block(parent, "Duvar (sağ)", c + along * segC + Vector3.up * (WallH * 0.5f), WallSize(alongX, segLen, WallH), wallMat);
-            Block(parent, "Kapı Üstü", c + Vector3.up * (DoorH + (WallH - DoorH) * 0.5f),
-                WallSize(alongX, DoorW, WallH - DoorH), wallMat);
-
-            // Kapı çerçevesi (çarpıştırıcısız, yalnızca görsel)
-            float depth = WallT + 0.08f;
-            Vector3 post = alongX ? new Vector3(0.1f, DoorH, depth) : new Vector3(depth, DoorH, 0.1f);
-            Block(parent, "Çerçeve", c + along * (half + 0.05f) + Vector3.up * (DoorH * 0.5f), post, doorFrameMat, false);
-            Block(parent, "Çerçeve", c + along * -(half + 0.05f) + Vector3.up * (DoorH * 0.5f), post, doorFrameMat, false);
-            Vector3 beam = alongX ? new Vector3(DoorW + 0.2f, 0.1f, depth) : new Vector3(depth, 0.1f, DoorW + 0.2f);
-            Block(parent, "Çerçeve", c + Vector3.up * (DoorH + 0.05f), beam, doorFrameMat, false);
-        }
-
-        static Vector3 WallSize(bool alongX, float length, float height)
-            => alongX ? new Vector3(length, height, WallT) : new Vector3(WallT, height, length);
-
-        // Giriş holündeki çıkış kapısı: duvarın önünde etkileşimli panel + yeşil çıkış levhası
-        void BuildExitDoor(Transform parent, Vector3Int e)
-        {
-            Vector3 c = new Vector3((e.x + 0.5f) * Cell, 0f, e.y * Cell); // güney duvarı (eksen X)
-            var panel = Block(parent, "Çıkış Kapısı", c + new Vector3(0f, 1.25f, 0.3f), new Vector3(1.8f, 2.5f, 0.1f), doorMat);
-            var door = panel.AddComponent<FacilityDoor>();
-            door.isExit = true;
-            Block(parent, "Çıkış Levhası", c + new Vector3(0f, 2.85f, 0.25f), new Vector3(1.0f, 0.22f, 0.06f), exitSignMat, false);
-            Block(parent, "Çıkış Çerçevesi", c + new Vector3(0f, 1.3f, 0.22f), new Vector3(2.0f, 2.7f, 0.06f), doorFrameMat, false);
-        }
-
-        // ---------- Işıklar ----------
-
-        void AddRoomLights(Room r, System.Random rng)
-        {
-            var cells = new List<Vector3>();
-            for (int cx = r.x; cx < r.x + r.w; cx++)
-                for (int cz = r.z; cz < r.z + r.d; cz++)
-                    cells.Add(new Vector3((cx + 0.5f) * Cell, 0f, (cz + 0.5f) * Cell));
-
-            // Floresan şeritler (karanlık odada sönük)
-            float yaw = r.w >= r.d ? 0f : 90f;
-            var stripMat = r.dark ? stripOffMat : stripOnMat;
-            foreach (var c in cells)
-                Block(r.root, "Floresan", new Vector3(c.x, WallH - 0.06f, c.z), new Vector3(1.6f, 0.06f, 0.3f), stripMat, false, yaw);
-
-            if (r.dark) return;
-            int n = Mathf.Clamp((cells.Count + 3) / 4, 1, 5);
-            for (int i = 0; i < n; i++)
+            for (int li = 0; li < Levels; li++)
             {
-                int idx = Mathf.Min(cells.Count - 1, (int)((i + 0.5f) * cells.Count / n));
-                var c = cells[idx];
-                AddLight(r.root, new Vector3(c.x, WallH - 0.5f, c.z), r.kind == RoomKind.Entrance && i == 0, rng);
-            }
-        }
-
-        void AddLight(Transform parent, Vector3 pos, bool shadows, System.Random rng)
-        {
-            var go = new GameObject("Floresan Işık");
-            go.transform.SetParent(parent, false);
-            go.transform.localPosition = pos;
-            var l = go.AddComponent<Light>();
-            l.type = LightType.Point;
-            l.color = new Color(0.85f, 0.95f, 1f);
-            l.intensity = 1.2f;
-            l.range = 6f;
-            l.shadows = shadows ? LightShadows.Soft : LightShadows.None;
-            if (rng.NextDouble() < 0.2)
-            {
-                var f = go.AddComponent<LightFlicker>(); // intensity ayarlandıktan sonra eklenir
-                f.flickerChance = 0.08f;
-            }
-        }
-
-        // ---------- Dekor ----------
-
-        void DecorateRoom(Room r, System.Random rng)
-        {
-            var edges = new List<Spot>();
-            var corners = new List<Spot>();
-            var inner = new List<Vector3>();
-            CollectSpots(r, edges, corners, inner);
-
-            switch (r.kind)
-            {
-                case RoomKind.Corridor:
-                    DecorCorridor(r, rng);
-                    break;
-
-                case RoomKind.Entrance:
-                    FloorLine(r.root, new Vector3(r.center.x - 1.1f, 0f, 4.0f), new Vector3(0.14f, 0.015f, 6f));
-                    FloorLine(r.root, new Vector3(r.center.x + 1.1f, 0f, 4.0f), new Vector3(0.14f, 0.015f, 6f));
-                    FloorLine(r.root, new Vector3(r.center.x, 0f, 1.0f), new Vector3(2.4f, 0.015f, 0.14f));
-                    HorizontalPipe(r, rng, 3.7f);
-                    var north = edges.FindAll(s0 => s0.inward.z < -0.5f);
-                    if (north.Count > 0) PlaceDesk(r.root, Take(north, rng), rng, true);
-                    var west = edges.FindAll(s0 => s0.inward.x > 0.5f);
-                    if (west.Count > 0) PlaceConsole(r.root, Take(west, rng), rng);
-                    if (corners.Count > 0) PlaceCrateOrBarrel(r.root, Take(corners, rng), rng);
-                    if (corners.Count > 0) PlaceCabinet(r.root, Take(corners, rng), rng);
-                    break;
-
-                case RoomKind.Small:
-                    if (edges.Count > 0) PlaceDesk(r.root, Take(edges, rng), rng, true);
-                    if (corners.Count > 0) PlaceCabinet(r.root, Take(corners, rng), rng);
-                    if (corners.Count > 0) PlaceCrateOrBarrel(r.root, Take(corners, rng), rng);
-                    if (corners.Count > 0 && rng.Next(2) == 0) PlaceCrateOrBarrel(r.root, Take(corners, rng), rng);
-                    break;
-
-                case RoomKind.Medium:
-                    for (int i = 0; i < 3 && edges.Count > 0; i++) PlaceConsole(r.root, Take(edges, rng), rng);
-                    if (edges.Count > 0) PlaceDesk(r.root, Take(edges, rng), rng, true);
-                    for (int i = 0; i < 2 && inner.Count > 0; i++) Pillar(r.root, TakeV(inner, rng));
-                    foreach (var sp in corners) PlaceCrateOrBarrel(r.root, sp, rng);
-                    HorizontalPipe(r, rng, 3.65f);
-                    break;
-
-                case RoomKind.Hall:
-                    // Kontrol odası: duvarlarda konsollar, ortada masalar ve direkler
-                    foreach (var sp in edges)
-                    {
-                        if (rng.NextDouble() < 0.7) PlaceConsole(r.root, sp, rng);
-                        else PlaceCabinet(r.root, sp, rng);
-                    }
-                    foreach (var v in inner)
-                    {
-                        double q = rng.NextDouble();
-                        if (q < 0.4) Pillar(r.root, v);
-                        else if (q < 0.7) Desk(r.root, v, rng.Next(2) * 90f, rng, true);
-                    }
-                    foreach (var sp in corners) PlaceCrateOrBarrel(r.root, sp, rng);
-                    FloorLine(r.root, new Vector3(r.center.x, 0f, r.center.z), new Vector3(r.w * Cell - 1.5f, 0.015f, 0.14f));
-                    FloorLine(r.root, new Vector3(r.center.x, 0f, r.center.z), new Vector3(0.14f, 0.015f, r.d * Cell - 1.5f));
-                    HorizontalPipe(r, rng, 3.7f);
-                    HorizontalPipe(r, rng, 3.4f);
-                    break;
-
-                case RoomKind.Storage:
-                    foreach (var sp in edges)
-                        if (rng.NextDouble() < 0.85) Shelf(r.root, sp.pos + sp.inward * 0.45f, YawOf(sp.inward), rng);
-                    foreach (var v in inner) Shelf(r.root, v, rng.Next(2) * 90f, rng);
-                    foreach (var sp in corners) PlaceCrateOrBarrel(r.root, sp, rng);
-                    break;
-            }
-
-            // Odanın zemininde birkaç ek ganimet noktası
-            if (r.kind != RoomKind.Entrance)
-            {
-                int extra = 1 + rng.Next(2);
-                for (int i = 0; i < extra; i++)
+                for (int z = -Org + 2; z < G - Org - 2; z++)
                 {
-                    float px = r.x * Cell + 1.2f + (float)rng.NextDouble() * (r.w * Cell - 2.4f);
-                    float pz = r.z * Cell + 1.2f + (float)rng.NextDouble() * (r.d * Cell - 2.4f);
-                    lootPoints.Add(new Vector3(px, 0.05f, pz));
+                    // yatay duvar çizgileri (kenar X boyunca, z çizgisinde)
+                    int x = -Org + 2;
+                    while (x < G - Org - 2)
+                    {
+                        int a = Owner(li, x, z - 1), b = Owner(li, x, z);
+                        if (a > 0 && b > 0 && a != b && HT(li, x, z) == 0)
+                        {
+                            int x2 = x;
+                            while (x2 + 1 < G - Org - 2 && Owner(li, x2 + 1, z - 1) == a && Owner(li, x2 + 1, z) == b && HT(li, x2 + 1, z) == 0) x2++;
+                            TryExtraDoor(li, true, z, x, x2 - x + 1, a, b, pairs, rng);
+                            x = x2 + 1;
+                        }
+                        else x++;
+                    }
+                }
+                for (int xl = -Org + 2; xl < G - Org - 2; xl++)
+                {
+                    int z = -Org + 2;
+                    while (z < G - Org - 2)
+                    {
+                        int a = Owner(li, xl - 1, z), b = Owner(li, xl, z);
+                        if (a > 0 && b > 0 && a != b && VT(li, xl, z) == 0)
+                        {
+                            int z2 = z;
+                            while (z2 + 1 < G - Org - 2 && Owner(li, xl - 1, z2 + 1) == a && Owner(li, xl, z2 + 1) == b && VT(li, xl, z2 + 1) == 0) z2++;
+                            TryExtraDoor(li, false, xl, z, z2 - z + 1, a, b, pairs, rng);
+                            z = z2 + 1;
+                        }
+                        else z++;
+                    }
                 }
             }
         }
 
-        void DecorCorridor(Room r, System.Random rng)
-        {
-            bool alongZ = r.d > r.w;
-            float len = Mathf.Max(r.w, r.d) * Cell;
-            Vector3 c = r.center;
-            Vector3 axis = alongZ ? Vector3.forward : Vector3.right;
-            Vector3 lat = alongZ ? Vector3.right : Vector3.forward;
+        static long PairKey(int a, int b) => a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
 
-            // Sarı güvenlik çizgileri
-            for (int s = -1; s <= 1; s += 2)
+        void TryExtraDoor(int li, bool alongX, int line, int start, int len, int a, int b, List<long> pairs, System.Random rng)
+        {
+            if (len < 4) return;
+            var sa = spaces[a - 1];
+            var sb = spaces[b - 1];
+            if (sa.kind == RoomKind.Entrance || sb.kind == RoomKind.Entrance || sa.IsStair || sb.IsStair) return;
+            if (sa.IsCorridor && sb.IsCorridor) return;
+            long key = PairKey(a, b);
+            if (pairs.Contains(key)) return;
+            if (rng.NextDouble() > 0.3) return;
+            int ds = start + 1 + rng.Next(Mathf.Max(1, len - 3));
+            if (ds + 2 > start + len - 1) ds = start + len - 3;
+            pairs.Add(key);
+            AddDoorAt(li, alongX, line, ds, 2, 1, OpenW, OpenHt);
+        }
+
+        // ---------- Görünüm atamaları ----------
+
+        void AssignAppearance(System.Random rng)
+        {
+            for (int i = 0; i < spaces.Count; i++)
             {
-                Vector3 size = alongZ ? new Vector3(0.12f, 0.015f, len - 0.6f) : new Vector3(len - 0.6f, 0.015f, 0.12f);
-                FloorLine(r.root, c + lat * (s * 1.5f), size);
-            }
-            // Tavan boruları
-            for (int s = -1; s <= 1; s += 2)
-            {
-                Vector3 a = c + lat * (s * 1.7f) + Vector3.up * 3.55f - axis * (len * 0.5f);
-                Pipe(r.root, a, a + axis * len, 0.16f);
-            }
-            // Uçta bir sandık ya da varil (kapı ağızlarını kapatmayacak şekilde)
-            if (rng.NextDouble() < 0.55)
-            {
-                float sideSign = rng.Next(2) == 0 ? -1f : 1f;
-                float endSign = rng.Next(2) == 0 ? -1f : 1f;
-                Vector3 p = c + lat * (sideSign * 1.45f) + axis * (endSign * (len * 0.5f - 0.5f));
-                if (rng.Next(2) == 0) Crate(r.root, p, 0.6f, rng.Next(20) - 10f, rng);
-                else Barrel(r.root, p);
+                var sp = spaces[i];
+                sp.paint = sp.kind == RoomKind.Entrance ? 0 : rng.Next(PaintCount);
+                sp.floorVar = sp.kind == RoomKind.Entrance ? 0 : rng.Next(3);
+                sp.variant = rng.Next(3);
+                sp.density = 0.45f + 0.55f * (float)rng.NextDouble();
+
+                // Işık: giriş holü hep aydınlık; diğerleri ~%40
+                if (sp.kind == RoomKind.Entrance) sp.lit = true;
+                else if (sp.IsStair) sp.lit = false;
+                else if (sp.IsCorridor) sp.lit = true; // koridorlar 12 m'de bir armatürle (bozuk olabilir)
+                else if (sp.kind == RoomKind.ControlRoom || sp.kind == RoomKind.RadioHall) sp.lit = rng.NextDouble() < 0.6;
+                else sp.lit = rng.NextDouble() < 0.38;
             }
         }
 
-        void HorizontalPipe(Room r, System.Random rng, float height)
+        void CreateSpaceRoots()
         {
-            bool alongX = r.w >= r.d;
-            float len = (alongX ? r.w : r.d) * Cell;
-            float off = ((float)rng.NextDouble() - 0.5f) * 2f;
-            Vector3 a = alongX
-                ? new Vector3(r.x * Cell, height, r.center.z + off)
-                : new Vector3(r.center.x + off, height, r.z * Cell);
-            Pipe(r.root, a, a + (alongX ? Vector3.right : Vector3.forward) * len, 0.2f);
-        }
-
-        // Odanın köşe/kenar/iç köşe noktaları (kapılar hücre kenarı ortasında; bu noktalar kapılardan >= 1 m uzakta)
-        void CollectSpots(Room r, List<Spot> edges, List<Spot> corners, List<Vector3> inner)
-        {
-            for (int i = 0; i <= r.w; i++)
-                for (int j = 0; j <= r.d; j++)
+            for (int i = 0; i < spaces.Count; i++)
+            {
+                var sp = spaces[i];
+                var go = new GameObject("Alan " + sp.id + " (" + sp.kind + ")");
+                var parent = sp.IsStair ? levelRoots[sp.lvLow] : levelRoots[sp.lv];
+                go.transform.SetParent(parent, false);
+                sp.root = go.transform;
+                if (sp.IsStair)
                 {
-                    var v = new Vector3((r.x + i) * Cell, 0f, (r.z + j) * Cell);
-                    bool bx = i == 0 || i == r.w, bz = j == 0 || j == r.d;
-                    if (bx && bz)
-                        corners.Add(new Spot { pos = v, inward = new Vector3(i == 0 ? 1f : -1f, 0f, j == 0 ? 1f : -1f), corner = true });
-                    else if (bx)
-                        edges.Add(new Spot { pos = v, inward = new Vector3(i == 0 ? 1f : -1f, 0f, 0f) });
-                    else if (bz)
-                        edges.Add(new Spot { pos = v, inward = new Vector3(0f, 0f, j == 0 ? 1f : -1f) });
-                    else inner.Add(v);
-                }
-        }
-
-        static float YawOf(Vector3 inward) => Mathf.Atan2(inward.x, inward.z) * Mathf.Rad2Deg;
-
-        static Spot Take(List<Spot> list, System.Random rng)
-        {
-            int i = rng.Next(list.Count);
-            var s = list[i];
-            list.RemoveAt(i);
-            return s;
-        }
-
-        static Vector3 TakeV(List<Vector3> list, System.Random rng)
-        {
-            int i = rng.Next(list.Count);
-            var v = list[i];
-            list.RemoveAt(i);
-            return v;
-        }
-
-        void PlaceDesk(Transform p, Spot sp, System.Random rng, bool monitor)
-            => Desk(p, sp.pos + sp.inward * (0.2f + 0.4f), YawOf(sp.inward), rng, monitor);
-
-        void PlaceConsole(Transform p, Spot sp, System.Random rng)
-            => Console(p, sp.pos + sp.inward * (0.2f + 0.35f), YawOf(sp.inward), rng);
-
-        void PlaceCabinet(Transform p, Spot sp, System.Random rng)
-        {
-            Vector3 pos = sp.pos + (sp.corner ? sp.inward.normalized * 0.8f : sp.inward * 0.45f);
-            Cabinet(p, pos, sp.corner ? 0f : YawOf(sp.inward));
-        }
-
-        void PlaceCrateOrBarrel(Transform p, Spot sp, System.Random rng)
-        {
-            Vector3 pos = sp.pos + sp.inward * 0.6f; // köşeden her iki duvardan 0.6 m
-            if (rng.Next(2) == 0) Crate(p, pos, 0.7f, rng.Next(16) - 8f, rng);
-            else Barrel(p, pos);
-        }
-
-        // ---------- Prop'lar ----------
-
-        Transform Prop(Transform parent, string name, Vector3 pos, float yaw)
-        {
-            var go = new GameObject(name);
-            go.transform.SetParent(parent, false);
-            go.transform.localPosition = pos;
-            go.transform.localRotation = Quaternion.Euler(0f, yaw, 0f);
-            return go.transform;
-        }
-
-        static Vector3 Local(Vector3 pos, float yaw, Vector3 offset) => pos + Quaternion.Euler(0f, yaw, 0f) * offset;
-
-        void Crate(Transform parent, Vector3 pos, float size, float yaw, System.Random rng)
-        {
-            float h = size * (0.7f + 0.5f * (float)rng.NextDouble());
-            Block(parent, "Sandık", pos + Vector3.up * (h * 0.5f), new Vector3(size, h, size), crateMat, true, yaw);
-            lootPoints.Add(pos + Vector3.up * (h + 0.03f));
-        }
-
-        void Barrel(Transform parent, Vector3 pos)
-        {
-            var go = new GameObject("Varil");
-            go.transform.SetParent(parent, false);
-            go.transform.localPosition = pos + Vector3.up * 0.45f;
-            go.transform.localScale = new Vector3(0.6f, 0.45f, 0.6f);
-            go.AddComponent<MeshFilter>().sharedMesh = CylinderMesh();
-            go.AddComponent<MeshRenderer>().sharedMaterial = metalMat;
-            var box = go.AddComponent<BoxCollider>();
-            box.size = new Vector3(1f, 2f, 1f); // silindir ilkeli 1x2x1
-        }
-
-        void Pillar(Transform parent, Vector3 pos)
-            => Block(parent, "Direk", pos + Vector3.up * (WallH * 0.5f), new Vector3(0.6f, WallH, 0.6f), concrete);
-
-        void Cabinet(Transform parent, Vector3 pos, float yaw)
-        {
-            var c = Prop(parent, "Dolap", pos, yaw);
-            Block(c, "Gövde", new Vector3(0f, 0.95f, 0f), new Vector3(0.9f, 1.9f, 0.5f), metalMat);
-            Block(c, "Kol", new Vector3(0.25f, 1.0f, 0.27f), new Vector3(0.05f, 0.3f, 0.04f), doorFrameMat, false);
-        }
-
-        void Desk(Transform parent, Vector3 pos, float yaw, System.Random rng, bool monitor)
-        {
-            var d = Prop(parent, "Masa", pos, yaw);
-            Block(d, "Tabla", new Vector3(0f, 0.76f, 0f), new Vector3(1.6f, 0.06f, 0.8f), deskMat);
-            Block(d, "Sol Ayak", new Vector3(-0.77f, 0.365f, 0f), new Vector3(0.06f, 0.73f, 0.76f), metalMat);
-            Block(d, "Sağ Ayak", new Vector3(0.77f, 0.365f, 0f), new Vector3(0.06f, 0.73f, 0.76f), metalMat);
-            if (monitor)
-            {
-                Block(d, "Monitör Ayağı", new Vector3(0f, 0.85f, -0.2f), new Vector3(0.08f, 0.12f, 0.08f), metalMat, false);
-                Block(d, "Monitör", new Vector3(0f, 1.05f, -0.2f), new Vector3(0.5f, 0.33f, 0.05f), screenMat, false);
-            }
-            float ox = ((float)rng.NextDouble() - 0.5f) * 0.9f;
-            lootPoints.Add(Local(pos, yaw, new Vector3(ox, 0.82f, 0.15f)));
-        }
-
-        void Console(Transform parent, Vector3 pos, float yaw, System.Random rng)
-        {
-            const float w = 1.6f, dp = 0.7f;
-            var c = Prop(parent, "Konsol", pos, yaw);
-            Block(c, "Gövde", new Vector3(0f, 0.45f, 0f), new Vector3(w, 0.9f, dp), metalMat);
-            // Eğik ekran
-            var screen = Block(c, "Ekran", new Vector3(0f, 1.25f, -0.18f), new Vector3(w * 0.8f, 0.45f, 0.05f), screenMat, false);
-            screen.transform.localRotation = Quaternion.Euler(-20f, 0f, 0f);
-            // Gösterge ışıkları
-            for (int i = 0; i < 4; i++)
-            {
-                bool red = rng.NextDouble() < 0.35;
-                Block(c, "Gösterge", new Vector3(-w * 0.5f + 0.3f + i * 0.35f, 0.93f, 0.18f),
-                    new Vector3(0.08f, 0.04f, 0.08f), red ? ledRedMat : ledGreenMat, false);
-            }
-        }
-
-        void Shelf(Transform parent, Vector3 pos, float yaw, System.Random rng)
-        {
-            const float L = 1.8f, D = 0.5f;
-            var s = Prop(parent, "Raf", pos, yaw);
-            Block(s, "Yan Sol", new Vector3(-(L * 0.5f - 0.025f), 1.0f, 0f), new Vector3(0.05f, 2.0f, D), metalMat);
-            Block(s, "Yan Sağ", new Vector3(L * 0.5f - 0.025f, 1.0f, 0f), new Vector3(0.05f, 2.0f, D), metalMat);
-            Block(s, "Arka", new Vector3(0f, 1.0f, -(D * 0.5f - 0.015f)), new Vector3(L, 2.0f, 0.03f), metalMat);
-            float[] ys = { 0.30f, 0.92f, 1.54f };
-            for (int i = 0; i < ys.Length; i++)
-            {
-                Block(s, "Tabla", new Vector3(0f, ys[i], 0f), new Vector3(L - 0.1f, 0.04f, D), deskMat);
-                float ox = ((float)rng.NextDouble() - 0.5f) * (L - 0.7f);
-                lootPoints.Add(Local(pos, yaw, new Vector3(ox, ys[i] + 0.05f, 0.02f)));
-                // Kutular raflara görsel doluluk katar
-                if (rng.NextDouble() < 0.6)
-                {
-                    float bx = ((float)rng.NextDouble() - 0.5f) * (L - 0.6f);
-                    if (Mathf.Abs(bx - ox) > 0.45f)
-                        Block(s, "Kutu", new Vector3(bx, ys[i] + 0.02f + 0.12f, 0.02f), new Vector3(0.3f, 0.24f, 0.3f), crateMat);
+                    var up = new GameObject("Üst kat parçası");
+                    up.transform.SetParent(levelRoots[sp.lv], false);
+                    sp.rootUp = up.transform;
                 }
             }
-        }
-
-        void FloorLine(Transform parent, Vector3 center, Vector3 size)
-            => Block(parent, "Güvenlik Çizgisi", new Vector3(center.x, size.y * 0.5f + 0.0005f, center.z), size, lineMat, false);
-
-        void Pipe(Transform parent, Vector3 a, Vector3 b, float dia)
-        {
-            Vector3 d = b - a;
-            float len = d.magnitude;
-            if (len < 0.01f) return;
-            var go = new GameObject("Boru");
-            go.transform.SetParent(parent, false);
-            go.transform.localPosition = (a + b) * 0.5f;
-            go.transform.localRotation = Quaternion.FromToRotation(Vector3.up, d / len);
-            go.transform.localScale = new Vector3(dia, len * 0.5f, dia); // silindir ilkeli 2 m boyunda
-            go.AddComponent<MeshFilter>().sharedMesh = CylinderMesh();
-            go.AddComponent<MeshRenderer>().sharedMaterial = pipeMat;
         }
 
         // ---------- Noktalar ve birleştirme ----------
+
+        Vector3 CenterOf(Space sp)
+        {
+            var r = sp.rects[0];
+            return new Vector3(r.x + r.w * 0.5f, 0f, r.z + r.d * 0.5f);
+        }
 
         void CollectPoints()
         {
             MimicSpawns.Clear();
             WanderPoints.Clear();
-            Vector3 entranceCenter = rooms.Count > 0 ? rooms[0].center : Vector3.zero;
-            Room farthest = null;
-            float farD = -1f;
-            foreach (var r in rooms)
+            Rooms.Clear();
+            DoorPoints.Clear();
+            Vector3 entranceCenter = spaces.Count > 0 ? CenterOf(spaces[0]) : Vector3.zero;
+
+            for (int i = 0; i < spaces.Count; i++)
             {
-                Vector3 world = genRoot.transform.TransformPoint(new Vector3(r.center.x, 0.05f, r.center.z));
-                WanderPoints.Add(world);
-                if (r.kind == RoomKind.Entrance) continue;
-                float d = Vector3.Distance(r.center, entranceCenter);
-                if (d >= 14f) MimicSpawns.Add(world);
-                if (d > farD) { farD = d; farthest = r; }
+                var sp = spaces[i];
+                int li = sp.IsStair ? sp.lvLow : sp.lv;
+                float baseY = LevelBase[li];
+
+                // Sınır: tüm dikdörtgenlerin birleşimi
+                var r0 = sp.rects[0];
+                float minX = r0.x, maxX = r0.x + r0.w, minZ = r0.z, maxZ = r0.z + r0.d;
+                for (int k = 1; k < sp.rects.Count; k++)
+                {
+                    var r = sp.rects[k];
+                    minX = Mathf.Min(minX, r.x); maxX = Mathf.Max(maxX, r.x + r.w);
+                    minZ = Mathf.Min(minZ, r.z); maxZ = Mathf.Max(maxZ, r.z + r.d);
+                }
+                float height = sp.IsStair ? StepH + RoomH : sp.h;
+                var lc = new Vector3((minX + maxX) * 0.5f, baseY + (height - 0.5f) * 0.5f - 0.25f, (minZ + maxZ) * 0.5f);
+                var info = new RoomInfo
+                {
+                    kind = sp.kind,
+                    theme = ThemeName(sp.kind),
+                    center = genRoot.transform.TransformPoint(new Vector3(lc.x, baseY + 0.05f, lc.z)),
+                    bounds = new Bounds(genRoot.transform.TransformPoint(lc), new Vector3(maxX - minX, height + 0.5f, maxZ - minZ)),
+                    dark = !sp.lit || sp.IsCorridor || sp.IsStair,
+                    corridor = sp.IsCorridor,
+                    large = sp.h >= HallH - 0.01f,
+                    level = li
+                };
+                Rooms.Add(info);
+                if (sp.IsStair) continue;
+
+                // Gezinti noktaları: oda merkezi; koridorlarda her ~8 m
+                if (sp.IsCorridor)
+                {
+                    CorridorRange(sp, out int cs, out int ce);
+                    bool alongZ = AlongZ(sp);
+                    for (float u = cs + 2f; u < ce - 1f; u += 8f)
+                    {
+                        var lp = alongZ ? new Vector3(r0.x + 1.5f, baseY + 0.05f, u) : new Vector3(u, baseY + 0.05f, r0.z + 1.5f);
+                        var wp = genRoot.transform.TransformPoint(lp);
+                        WanderPoints.Add(wp);
+                        if (Vector3.Distance(lp, new Vector3(entranceCenter.x, lp.y, entranceCenter.z)) >= 14f || li != EntLv) MimicSpawns.Add(wp);
+                    }
+                }
+                else
+                {
+                    var wp = genRoot.transform.TransformPoint(new Vector3(CenterOf(sp).x, baseY + 0.05f, CenterOf(sp).z));
+                    WanderPoints.Add(wp);
+                    if (sp.kind != RoomKind.Entrance &&
+                        (li != EntLv || Vector3.Distance(CenterOf(sp), entranceCenter) >= 14f))
+                        MimicSpawns.Add(wp);
+                }
             }
-            if (MimicSpawns.Count == 0 && farthest != null)
-                MimicSpawns.Add(genRoot.transform.TransformPoint(new Vector3(farthest.center.x, 0.05f, farthest.center.z)));
+
+            for (int i = 0; i < doors.Count; i++)
+            {
+                var d = doors[i];
+                if (d.kind == 2) continue;
+                float cx = d.alongX ? d.start + d.n * 0.5f : d.line;
+                float cz = d.alongX ? d.line : d.start + d.n * 0.5f;
+                DoorPoints.Add(genRoot.transform.TransformPoint(new Vector3(cx, LevelBase[d.lv] + 0.05f, cz)));
+            }
+            if (MimicSpawns.Count == 0 && WanderPoints.Count > 1) MimicSpawns.Add(WanderPoints[WanderPoints.Count - 1]);
         }
 
-        // Her odanın statik geometrisini toplu çizim için birleştir (hata olursa sessizce atla)
+        static string ThemeName(RoomKind k)
+        {
+            switch (k)
+            {
+                case RoomKind.Entrance: return "Giriş Holü";
+                case RoomKind.Corridor: return "Koridor";
+                case RoomKind.Stair: return "Merdiven";
+                case RoomKind.ControlRoom: return "Kontrol Odası";
+                case RoomKind.RadioHall: return "Anten Ekipman Salonu";
+                case RoomKind.RadioRoom: return "Telsiz Odası";
+                case RoomKind.Warehouse: return "Depo Salonu";
+                case RoomKind.Storage: return "Depo";
+                case RoomKind.Office: return "Ofis";
+                case RoomKind.Bunk: return "Koğuş";
+                case RoomKind.Generator: return "Jeneratör Odası";
+                case RoomKind.Locker: return "Soyunma Odası";
+                case RoomKind.Workshop: return "Atölye";
+                case RoomKind.Closet: return "Kiler";
+                case RoomKind.PipeRoom: return "Boru Odası";
+                case RoomKind.Mess: return "Yemekhane";
+                default: return k.ToString();
+            }
+        }
+
+        // Her alanın statik geometrisini toplu çizim için birleştir (hata olursa sessizce atla)
         void CombineStatic()
         {
-            foreach (var r in rooms)
+            try
             {
-                if (r.root == null) continue;
-                try { StaticBatchingUtility.Combine(r.root.gameObject); }
-                catch (System.Exception e) { Debug.LogWarning("[Tesis] Statik birleştirme atlandı: " + e.Message); break; }
+                for (int i = 0; i < Levels; i++)
+                {
+                    if (wallRoots[i] != null) StaticBatchingUtility.Combine(wallRoots[i].gameObject);
+                }
+                foreach (var sp in spaces)
+                {
+                    if (sp.root != null) StaticBatchingUtility.Combine(sp.root.gameObject);
+                    if (sp.rootUp != null) StaticBatchingUtility.Combine(sp.rootUp.gameObject);
+                }
             }
+            catch (System.Exception e) { Debug.LogWarning("[Tesis] Statik birleştirme atlandı: " + e.Message); }
         }
 
         void RebuildNavMesh()
@@ -836,7 +1024,7 @@ namespace MimicGame.Level
             if (lootPoints.Count == 0) return;
 
             var rng = new System.Random(generatedSeed ^ 0x5F3759DF);
-            int want = Mathf.Min(rng.Next(minLoot, maxLoot + 1), lootPoints.Count);
+            int want = Mathf.Min(rng.Next(lootMin, lootMax + 1), lootPoints.Count);
             var pts = new List<Vector3>(lootPoints);
             int spawned = 0;
             for (int i = 0; i < want; i++)
@@ -854,81 +1042,6 @@ namespace MimicGame.Level
                 spawned++;
             }
             Debug.Log("[Tesis] " + spawned + " ganimet doğdu.");
-        }
-
-        // ---------- Yardımcılar ----------
-
-        // Birim küp ilkeli: ölçek = boyut. Çarpıştırıcı isteğe bağlı.
-        GameObject Block(Transform parent, string name, Vector3 pos, Vector3 size, Material mat,
-            bool collider = true, float yaw = 0f)
-        {
-            var go = new GameObject(name);
-            var t = go.transform;
-            t.SetParent(parent, false);
-            t.localPosition = pos;
-            t.localRotation = Quaternion.Euler(0f, yaw, 0f);
-            t.localScale = size;
-            go.AddComponent<MeshFilter>().sharedMesh = CubeMesh();
-            go.AddComponent<MeshRenderer>().sharedMaterial = mat;
-            if (collider) go.AddComponent<BoxCollider>();
-            return go;
-        }
-
-        static Mesh CubeMesh()
-        {
-            if (cubeMesh == null) cubeMesh = PrimitiveMesh(PrimitiveType.Cube);
-            return cubeMesh;
-        }
-
-        static Mesh CylinderMesh()
-        {
-            if (cylinderMesh == null) cylinderMesh = PrimitiveMesh(PrimitiveType.Cylinder);
-            return cylinderMesh;
-        }
-
-        static Mesh PrimitiveMesh(PrimitiveType type)
-        {
-            var tmp = GameObject.CreatePrimitive(type);
-            var mesh = tmp.GetComponent<MeshFilter>().sharedMesh;
-            DestroyImmediate(tmp); // çarpıştırıcısı fizik/NavMesh'e karışmasın
-            return mesh;
-        }
-
-        // Atanmamış malzemeler için çalışma anı yedeği
-        void EnsureMaterials()
-        {
-            Ensure(ref concrete, new Color(0.2f, 0.2f, 0.21f), default);
-            Ensure(ref wallMat, new Color(0.3f, 0.26f, 0.22f), default);
-            Ensure(ref ceilingMat, new Color(0.12f, 0.12f, 0.13f), default);
-            Ensure(ref lineMat, new Color(0.85f, 0.7f, 0.1f), default);
-            Ensure(ref metalMat, new Color(0.28f, 0.3f, 0.3f), default);
-            Ensure(ref crateMat, new Color(0.35f, 0.26f, 0.15f), default);
-            Ensure(ref deskMat, new Color(0.25f, 0.22f, 0.2f), default);
-            Ensure(ref doorFrameMat, new Color(0.1f, 0.1f, 0.11f), default);
-            Ensure(ref doorMat, new Color(0.15f, 0.25f, 0.2f), default);
-            Ensure(ref screenMat, new Color(0.05f, 0.2f, 0.15f), new Color(0.2f, 1.2f, 0.9f));
-            Ensure(ref stripOnMat, new Color(0.8f, 0.9f, 1f), new Color(2.2f, 2.4f, 2.6f));
-            Ensure(ref stripOffMat, new Color(0.1f, 0.1f, 0.1f), default);
-            Ensure(ref ledGreenMat, new Color(0.05f, 0.3f, 0.05f), new Color(0.2f, 2f, 0.3f));
-            Ensure(ref ledRedMat, new Color(0.3f, 0.05f, 0.05f), new Color(2f, 0.2f, 0.15f));
-            Ensure(ref exitSignMat, new Color(0.05f, 0.3f, 0.1f), new Color(0.2f, 2f, 0.5f));
-            Ensure(ref pipeMat, new Color(0.25f, 0.2f, 0.17f), default);
-        }
-
-        static void Ensure(ref Material m, Color color, Color emission)
-        {
-            if (m != null) return;
-            var shader = Shader.Find("Universal Render Pipeline/Lit");
-            if (shader == null) shader = Shader.Find("Standard");
-            m = new Material(shader);
-            if (m.HasProperty("_BaseColor")) m.SetColor("_BaseColor", color);
-            else m.color = color;
-            if (m.HasProperty("_Smoothness")) m.SetFloat("_Smoothness", 0.2f);
-            if (emission.maxColorComponent > 0f)
-            {
-                m.EnableKeyword("_EMISSION");
-                m.SetColor("_EmissionColor", emission);
-            }
         }
     }
 }
